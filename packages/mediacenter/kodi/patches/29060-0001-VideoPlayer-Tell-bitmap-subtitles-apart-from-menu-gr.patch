@@ -1,0 +1,106 @@
+From 5117958eae3bb9a7a81878a13c072fc5be082ac2 Mon Sep 17 00:00:00 2001
+From: cinemaONE <35371193+cinema-ONE@users.noreply.github.com>
+Date: Sun, 23 Aug 2026 13:14:54 +0200
+Subject: [PATCH 1/4] [VideoPlayer] Tell bitmap subtitles apart from menu
+ graphics
+
+CDVDOverlayImage and CDVDOverlaySpu are not subtitle classes. They are the
+overlay classes, and subtitles are only one of the things that arrive through
+them:
+
+  - Blu-ray IG and PG menus are built as CDVDOverlayImage directly by
+    CDVDInputStreamBluray, through both the paletted and the ARGB callback.
+  - DVD menu button highlights are CDVDOverlaySpu, painted by
+    CDVDOverlayContainer via CDVDInputStreamNavigator::GetCurrentButtonInfo.
+  - DVB subtitles share the FFmpeg overlay codec with PGS, but a broadcaster
+    also sends logos and station graphics on that track, placed where the
+    broadcaster meant them to be.
+
+Nothing today needs to make that distinction, because nothing today treats an
+image overlay as anything other than a bitmap to be drawn where it says. Any
+change that lets the user move or resize subtitles does need it: a setting that
+also moved Blu-ray menu buttons would take them off their hotspots, and one that
+shrank a broadcaster's station logo would be plainly wrong.
+
+Mark the overlay at the point where it is known: CDVDOverlayCodecFFmpeg::
+GetOverlay knows the codec it decoded, and PGS and VobSub carry nothing but
+pictures of subtitle text. Everything else keeps the default of false, so this
+commit changes no behaviour on its own.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ xbmc/cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlay.h    | 9 +++++++++
+ .../DVDCodecs/Overlay/DVDOverlayCodecFFmpeg.cpp          | 5 +++++
+ xbmc/cores/VideoPlayer/VideoPlayerSubtitle.cpp           | 2 ++
+ 3 files changed, 16 insertions(+)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlay.h b/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlay.h
+index bb588a0f47..d816718143 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlay.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlay.h
+@@ -37,6 +37,7 @@ public:
+     m_enableTextAlign = false;
+     m_overlayContainerFlushable = true;
+     m_setForcedMargins = false;
++    m_isBitmapSubtitle = false;
+   }
+ 
+   CDVDOverlay(const CDVDOverlay& src) : std::enable_shared_from_this<CDVDOverlay>(src)
+@@ -50,6 +51,7 @@ public:
+     m_enableTextAlign = src.m_enableTextAlign;
+     m_overlayContainerFlushable = src.m_overlayContainerFlushable;
+     m_setForcedMargins = src.m_setForcedMargins;
++    m_isBitmapSubtitle = src.m_isBitmapSubtitle;
+   }
+ 
+   virtual ~CDVDOverlay() = default;
+@@ -104,6 +106,12 @@ public:
+    */
+   bool IsForcedMargins() const { return m_setForcedMargins; }
+ 
++  /*! \brief Mark the overlay as a picture of subtitle text, as opposed to menu graphics */
++  void SetBitmapSubtitle(bool isBitmapSubtitle) { m_isBitmapSubtitle = isBitmapSubtitle; }
++
++  /*! \brief Whether the overlay is a picture of subtitle text */
++  bool IsBitmapSubtitle() const { return m_isBitmapSubtitle; }
++
+   double iPTSStartTime;
+   double iPTSStopTime;
+   bool bForced; // display, no matter what
+@@ -115,6 +123,7 @@ protected:
+   bool m_enableTextAlign;
+   bool m_overlayContainerFlushable;
+   bool m_setForcedMargins;
++  bool m_isBitmapSubtitle;
+ };
+ 
+ using VecOverlays = std::vector<std::shared_ptr<CDVDOverlay>>;
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlayCodecFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlayCodecFFmpeg.cpp
+index 670159ec41..b862ceaec9 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlayCodecFFmpeg.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlayCodecFFmpeg.cpp
+@@ -281,6 +281,11 @@ std::shared_ptr<CDVDOverlay> CDVDOverlayCodecFFmpeg::GetOverlay()
+     overlay->source_width = m_width;
+     overlay->source_height = m_height;
+ 
++    // DVB not marked: that path also carries broadcast logos and graphics
++    const AVCodecID codecId = m_pCodecContext->codec_id;
++    overlay->SetBitmapSubtitle(codecId == AV_CODEC_ID_HDMV_PGS_SUBTITLE ||
++                               codecId == AV_CODEC_ID_DVD_SUBTITLE);
++
+     uint8_t* s = rect.data[0];
+     uint8_t* t = overlay->pixels.data();
+ 
+diff --git a/xbmc/cores/VideoPlayer/VideoPlayerSubtitle.cpp b/xbmc/cores/VideoPlayer/VideoPlayerSubtitle.cpp
+index 6529b01065..d097383adc 100644
+--- a/xbmc/cores/VideoPlayer/VideoPlayerSubtitle.cpp
++++ b/xbmc/cores/VideoPlayer/VideoPlayerSubtitle.cpp
+@@ -91,6 +91,8 @@ void CVideoPlayerSubtitle::SendMessage(std::shared_ptr<CDVDMsg> pMsg, int priori
+       if (pSPUInfo)
+       {
+         CLog::Log(LOGDEBUG, "CVideoPlayer::ProcessSubData: Got complete SPU packet");
++        // A forced SPU here is a menu button highlight, not a subtitle (FSTA_DSP)
++        pSPUInfo->SetBitmapSubtitle(!pSPUInfo->bForced);
+         m_pOverlayContainer->ProcessAndAddOverlayIfValid(pSPUInfo);
+       }
+     }
