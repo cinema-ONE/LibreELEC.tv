@@ -1,7 +1,7 @@
 From 580881d9742f35eb4795a46f6bebe29200f6b7c4 Mon Sep 17 00:00:00 2001
 From: cinemaONE <35371193+cinema-ONE@users.noreply.github.com>
 Date: Sun, 23 Aug 2026 13:16:07 +0200
-Subject: [PATCH 3/4] [Subtitles] Let bitmap subtitles be resized and
+Subject: [PATCH 3/5] [Subtitles] Let bitmap subtitles be resized and
  repositioned
 
 Kodi exposes no control at all over picture based subtitles. PGS and VobSub are

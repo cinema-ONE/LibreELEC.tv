@@ -1,7 +1,7 @@
 From 9c46fffc79f367a532071a0d6f8963ec632fff3c Mon Sep 17 00:00:00 2001
 From: cinemaONE <35371193+cinema-ONE@users.noreply.github.com>
 Date: Sun, 23 Aug 2026 13:15:40 +0200
-Subject: [PATCH 2/4] [VideoRenderers] Resolve overlay geometry for the whole
+Subject: [PATCH 2/5] [VideoRenderers] Resolve overlay geometry for the whole
  frame before drawing
 
 CRenderer::Render walked the overlay buffer and drew each overlay as it went,

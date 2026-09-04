@@ -1,7 +1,7 @@
 From 69acded5552142f9cc402e2edfafb7a72e47d00b Mon Sep 17 00:00:00 2001
 From: cinemaONE <35371193+cinema-ONE@users.noreply.github.com>
 Date: Sun, 23 Aug 2026 18:15:30 +0200
-Subject: [PATCH 4/4] [Subtitles] Add keymap actions for the bitmap subtitle
+Subject: [PATCH 4/5] [Subtitles] Add keymap actions for the bitmap subtitle
  settings
 
 The two settings added by the previous commit are reachable from the settings

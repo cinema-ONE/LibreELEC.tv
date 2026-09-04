@@ -1,0 +1,45 @@
+From cd29072a0dd6f515987c9bb477d0ecebfd06cf2a Mon Sep 17 00:00:00 2001
+From: cinemaONE <35371193+cinema-ONE@users.noreply.github.com>
+Date: Fri, 4 Sep 2026 12:56:10 +0200
+Subject: [PATCH 5/5] [Subtitles] Place bitmap subtitles on the text margin
+
+Inside the video, text subtitles receive the vertical margin as a libass
+style MarginV, scaled by PlayResY / 720 and then by the picture height.
+Use the same value for repositioned bitmap subtitles, so both formats
+sit on one line for the same setting.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ .../VideoRenderers/OverlayRenderer.cpp            | 15 +++++++++++++--
+ 1 file changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.cpp
+index 7a6887102e..3c0b3c0fa4 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.cpp
+@@ -406,12 +406,23 @@ void CRenderer::RepositionBitmapSubtitles(std::vector<SRenderItem>& items) const
+                            m_subtitleAlign == SUBTITLES::Align::TOP_INSIDE;
+   const CRect& edges = insideVideo ? picture : m_rv;
+ 
++  // Inside the video, text gets the margin as a libass style MarginV, which
++  // CDVDSubtitlesLibass scales by PlayResY / 720 and libass by the picture
++  // height; use the same value so both formats sit on one line
++  float margin = static_cast<float>(m_subtitleVerticalMargin);
++  if (insideVideo && m_overlayStyle)
++  {
++    constexpr float viewport = static_cast<float>(SUBTITLES::STYLE::VIEWPORT_HEIGHT);
++    const int marginV = static_cast<int>(m_overlayStyle->marginVertical * (viewport / 720.0f));
++    margin = static_cast<float>(marginV) * edges.Height() / viewport;
++  }
++
+   // m_subtitlePosition is the libass baseline in view coordinates with the
+   // margin already subtracted, so Align::MANUAL calibration is honoured
+   const float bottomTarget =
+-      insideVideo ? edges.y2 - static_cast<float>(m_subtitleVerticalMargin)
++      insideVideo ? edges.y2 - margin
+                   : m_rv.y1 + static_cast<float>(m_subtitlePosition - resInfo.Overscan.top);
+-  const float topTarget = edges.y1 + static_cast<float>(m_subtitleVerticalMargin);
++  const float topTarget = edges.y1 + margin;
+ 
+   for (size_t first = 0; first < subs.size();)
+   {

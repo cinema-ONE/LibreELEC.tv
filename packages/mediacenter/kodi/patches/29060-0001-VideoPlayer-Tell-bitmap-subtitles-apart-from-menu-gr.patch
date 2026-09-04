@@ -1,7 +1,7 @@
 From 5117958eae3bb9a7a81878a13c072fc5be082ac2 Mon Sep 17 00:00:00 2001
 From: cinemaONE <35371193+cinema-ONE@users.noreply.github.com>
 Date: Sun, 23 Aug 2026 13:14:54 +0200
-Subject: [PATCH 1/4] [VideoPlayer] Tell bitmap subtitles apart from menu
+Subject: [PATCH 1/5] [VideoPlayer] Tell bitmap subtitles apart from menu
  graphics
 
 CDVDOverlayImage and CDVDOverlaySpu are not subtitle classes. They are the
