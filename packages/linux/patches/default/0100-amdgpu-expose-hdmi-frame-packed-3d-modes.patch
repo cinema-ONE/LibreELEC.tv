@@ -1,0 +1,51 @@
+From: cinemaONE <35371193+cinema-ONE@users.noreply.github.com>
+Subject: [PATCH] drm/amd/display: expose HDMI frame-packed 3D modes
+
+amdgpu never allows stereo modes, so a sink's HDMI 3D modes are dropped by
+DRM before userspace sees them. DC already implements software frame
+packing (TIMING_3D_FORMAT_SW_FRAME_PACKING) and builds the HDMI 1.4 vendor
+infoframe with 3D_Structure = frame packing for it; the driver just never
+maps the DRM mode flag to it.
+
+Allow stereo on HDMI connectors, and when the mode carries
+DRM_MODE_FLAG_3D_FRAME_PACKING mark the stream as software frame packed
+with a frame-sequential view. The CRTC timing DRM computes for such a mode
+is already the doubled one (drm_mode_set_crtcinfo, CRTC_STEREO_DOUBLE),
+which is what SW_FRAME_PACKING expects; HW_FRAME_PACKING would double the
+pixel clock a second time and is not used.
+
+Experimental. Tested against Linux 7.2.3 on Navi 33 only.
+---
+ drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -7014,7 +7014,15 @@ static void fill_stream_properties_from_drm_display_mode(
+ 	else
+ 		timing_out->pixel_encoding = PIXEL_ENCODING_RGB;
+ 
+-	timing_out->timing_3d_format = TIMING_3D_FORMAT_NONE;
++	if ((mode_in->flags & DRM_MODE_FLAG_3D_MASK) == DRM_MODE_FLAG_3D_FRAME_PACKING) {
++		/* DRM already doubled the CRTC timing for this mode */
++		timing_out->timing_3d_format = TIMING_3D_FORMAT_SW_FRAME_PACKING;
++		stream->view_format = VIEW_3D_FORMAT_FRAME_SEQUENTIAL;
++	} else {
++		timing_out->timing_3d_format = TIMING_3D_FORMAT_NONE;
++		stream->view_format = VIEW_3D_FORMAT_NONE;
++	}
++
+ 	timing_out->display_color_depth = convert_color_depth_from_display_info(
+ 		connector,
+ 		(timing_out->pixel_encoding == PIXEL_ENCODING_YCBCR420),
+@@ -9322,7 +9330,8 @@ static int amdgpu_dm_connector_init(struct amdgpu_display_manager *dm,
+ 	aconnector->dc_link = link;
+ 	aconnector->base.interlace_allowed = false;
+ 	aconnector->base.doublescan_allowed = false;
+-	aconnector->base.stereo_allowed = false;
++	/* HDMI only: DP->HDMI dongles reject 3D timings in link validation */
++	aconnector->base.stereo_allowed = connector_type == DRM_MODE_CONNECTOR_HDMIA;
+ 	aconnector->base.dpms = DRM_MODE_DPMS_OFF;
+ 	aconnector->hpd.hpd = AMDGPU_HPD_NONE; /* not used */
+ 	aconnector->audio_inst = -1;
