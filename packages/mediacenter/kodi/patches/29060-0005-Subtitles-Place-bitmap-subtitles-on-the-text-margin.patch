@@ -1,7 +1,7 @@
 From cd29072a0dd6f515987c9bb477d0ecebfd06cf2a Mon Sep 17 00:00:00 2001
 From: cinemaONE <35371193+cinema-ONE@users.noreply.github.com>
 Date: Fri, 4 Sep 2026 12:56:10 +0200
-Subject: [PATCH 5/5] [Subtitles] Place bitmap subtitles on the text margin
+Subject: [PATCH 05/22] [Subtitles] Place bitmap subtitles on the text margin
 
 Inside the video, text subtitles receive the vertical margin as a libass
 style MarginV, scaled by PlayResY / 720 and then by the picture height.

@@ -1,0 +1,137 @@
+From 9a257e9ae43a4d2effa32dbf34856c8842de3a33 Mon Sep 17 00:00:00 2001
+From: Dom Cobley <popcornmix@gmail.com>
+Date: Sun, 26 Jul 2026 17:14:10 +0100
+Subject: [PATCH 10/22] LinuxRendererGLES: fix stereoscopic (SBS/TAB) source
+ cropping
+
+CLinuxRendererGLES never showed one eye of a side-by-side or top-and-bottom
+source: it displayed the whole packed frame in each eye. Two omissions relative
+to CLinuxRendererGL, fixed here by bringing GLES into line with GL. Nothing in
+the non-stereoscopic path changes - for 2D content m_sourceRect is always the
+whole frame, so the texture coordinates come out exactly as before.
+
+- Configure() never set m_iFlags, so CBaseRenderer::ManageRenderArea() saw
+  CONF_FLAGS_STEREO_MODE_MASK == 0 and never cropped m_sourceRect to an eye.
+
+- CalculateTextureSourceRects() was called from the three Upload*Texture()
+  helpers, i.e. only when a buffer is (re)uploaded. ManageRenderArea() moves
+  m_sourceRect between the eyes on every render, so a cached buffer kept the
+  crop from its first upload and the second eye sampled the wrong half. Move
+  the call into UploadTexture() where it runs unconditionally, as
+  CLinuxRendererGL already does.
+
+(cherry picked from commit d60dd09ac34bb76a153f63d74e9ce8d69ffb0724)
+---
+ .../VideoRenderers/LinuxRendererGLES.cpp      | 57 ++++++++++---------
+ 1 file changed, 30 insertions(+), 27 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.cpp
+index 7b519e4ad7..e990d9bf65 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.cpp
+@@ -15,6 +15,7 @@
+ #include "VideoShaders/dither.h"
+ #include "application/Application.h"
+ #include "cores/IPlayer.h"
++#include "cores/VideoPlayer/VideoRenderers/RenderFlags.h"
+ #include "guilib/Texture.h"
+ #include "rendering/GLExtensions.h"
+ #include "rendering/MatrixGL.h"
+@@ -189,6 +190,9 @@ bool CLinuxRendererGLES::Configure(const VideoPicture &picture, float fps, unsig
+   m_sourceHeight = picture.iHeight;
+   m_renderOrientation = orientation;
+ 
++  m_iFlags =
++      GetFlagsChromaPosition(picture.chroma_position) | GetFlagsStereoMode(picture.stereoMode);
++
+   m_srcPrimaries = picture.color_primaries;
+   m_srcColorBits = picture.colorBits;
+   m_srcFullRange = picture.color_range == 1;
+@@ -1101,34 +1105,39 @@ bool CLinuxRendererGLES::UploadTexture(int index)
+     return false;
+   }
+ 
+-  if (m_buffers[index].loaded)
+-  {
+-    return true;
+-  }
++  bool ret{true};
+ 
+-  bool ret{false};
++  if (!m_buffers[index].loaded)
++  {
++    YuvImage& dst = m_buffers[index].image;
++    m_buffers[index].videoBuffer->GetPlanes(dst.plane);
++    m_buffers[index].videoBuffer->GetStrides(dst.stride);
+ 
+-  YuvImage &dst = m_buffers[index].image;
+-  m_buffers[index].videoBuffer->GetPlanes(dst.plane);
+-  m_buffers[index].videoBuffer->GetStrides(dst.stride);
++    if (m_format == AV_PIX_FMT_NV12)
++    {
++      ret = UploadNV12Texture(index);
++    }
++    else if (m_format == AV_PIX_FMT_YUYV422 || m_format == AV_PIX_FMT_UYVY422)
++    {
++      ret = UploadPackedYUVTexture(index);
++    }
++    else
++    {
++      // default to planar YUV texture handlers
++      ret = UploadPlanarYUVTexture(index);
++    }
+ 
+-  if (m_format == AV_PIX_FMT_NV12)
+-  {
+-    ret = UploadNV12Texture(index);
+-  }
+-  else if (m_format == AV_PIX_FMT_YUYV422 || m_format == AV_PIX_FMT_UYVY422)
+-  {
+-    ret = UploadPackedYUVTexture(index);
+-  }
+-  else
+-  {
+-    // default to planar YUV texture handlers
+-    ret = UploadPlanarYUVTexture(index);
++    if (ret)
++    {
++      m_buffers[index].loaded = true;
++    }
+   }
+ 
++  // recalculate on every render, not just on upload: ManageRenderArea() moves
++  // m_sourceRect between the two eyes of a stereoscopic source
+   if (ret)
+   {
+-    m_buffers[index].loaded = true;
++    CalculateTextureSourceRects(index, 3);
+   }
+ 
+   return ret;
+@@ -1602,8 +1611,6 @@ bool CLinuxRendererGLES::UploadPlanarYUVTexture(int source)
+ 
+   VerifyGLState();
+ 
+-  CalculateTextureSourceRects(source, 3);
+-
+   return true;
+ }
+ 
+@@ -1807,8 +1814,6 @@ bool CLinuxRendererGLES::UploadNV12Texture(int source)
+ 
+   VerifyGLState();
+ 
+-  CalculateTextureSourceRects(source, 3);
+-
+   return true;
+ }
+ 
+@@ -1964,8 +1969,6 @@ bool CLinuxRendererGLES::UploadPackedYUVTexture(int source)
+ 
+   VerifyGLState();
+ 
+-  CalculateTextureSourceRects(source, 3);
+-
+   return true;
+ }
+ 

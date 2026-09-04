@@ -1,0 +1,98 @@
+From e89156c68376665d257aa7779f28009227a16682 Mon Sep 17 00:00:00 2001
+From: Dom Cobley <popcornmix@gmail.com>
+Date: Sun, 23 Aug 2026 11:45:18 +0100
+Subject: [PATCH 19/22] Resolution: do not leave 2D content in a hardware 3D
+ mode
+
+Matching no display mode leaves the one that is already set, which is right when
+it was chosen for something like this content and wrong when it was chosen for a
+3D title: a hardware 3D mode makes the sink split every frame and show half of
+it to each eye, so 2D content plays doubled and squeezed. It takes a rate the
+whitelist has no mode for -- 30fps, with double refresh rates turned off -- to
+reach, and then only after playing 3D, but from there nothing puts it right,
+because a mode is only reconsidered when the content changes again.
+
+Fall back to the desktop mode, the one mode known to be meant for a single
+image, and the one playing the same content from a cold start would have left in
+place. Only where it is 2D itself: a display set up in a 3D mode by hand is the
+viewer's arrangement to keep.
+
+At the point every search funnels through rather than at the end of the
+whitelist, so an override cannot get past it either, and reading the flags from
+CDisplaySettings, since GetResInfo() ORs the stereo mode in effect onto whatever
+it returns and so cannot say whether a mode is natively 3D.
+
+(cherry picked from commit a847d47239eda960bc9a4a0ec815d859739b2751)
+---
+ xbmc/windowing/Resolution.cpp | 42 ++++++++++++++++++++++++++++++-----
+ 1 file changed, 36 insertions(+), 6 deletions(-)
+
+diff --git a/xbmc/windowing/Resolution.cpp b/xbmc/windowing/Resolution.cpp
+index 8b322ef9ce..d20fce8ced 100644
+--- a/xbmc/windowing/Resolution.cpp
++++ b/xbmc/windowing/Resolution.cpp
+@@ -144,6 +144,22 @@ std::vector<RESOLUTION> Find3DCandidates(const std::vector<CVariant>& indexList,
+   return candidates;
+ }
+ 
++//! @brief Whether the output puts a single image on the whole screen, so that a hardware
++//!        3D mode is the wrong shape for it.
++//!
++//! Takes the requested stereo mode rather than the current one: SetStereoMode() is
++//! deferred to the next flip, so a search triggered by the change itself - which is
++//! exactly when the display mode has to be re-chosen - would otherwise still see the
++//! mode being left behind.
++bool Wants2DOutput(bool is3D)
++{
++  const RenderStereoMode stereoMode =
++      CServiceBroker::GetWinSystem()->GetGfxContext().GetNextStereoMode();
++
++  return !is3D || (stereoMode != RenderStereoMode::SPLIT_VERTICAL &&
++                   stereoMode != RenderStereoMode::SPLIT_HORIZONTAL);
++}
++
+ //! @brief The refresh rates to try for a native 3D mode, best first: the content rate,
+ //!        then double it, then a 3:2 pulldown rate, then the rate the GUI is running at.
+ //!
+@@ -322,6 +338,24 @@ RESOLUTION CResolutionUtils::ChooseBestResolution(float fps, int width, int heig
+     }
+   }
+ 
++  // Matching nothing leaves the mode that was already set, which after a 3D title is a
++  // hardware 3D one. Keeping it for 2D output means the sink goes on splitting the frame
++  // and showing half of it to each eye. Nothing about it was chosen for this content, so
++  // rather than keep it, fall back to the desktop mode - the one mode known to be meant
++  // for a single image, and what playing the same content from a cold start would have
++  // left in place.
++  if (Wants2DOutput(is3D) &&
++      (CDisplaySettings::GetInstance().GetResolutionInfo(res).dwFlags & STEREO_FLAGS))
++  {
++    const RESOLUTION desktop = CDisplaySettings::GetInstance().GetCurrentResolution();
++
++    if ((CDisplaySettings::GetInstance().GetResolutionInfo(desktop).dwFlags & STEREO_FLAGS) == 0)
++    {
++      CLog::Log(LOGDEBUG, "[WHITELIST] No 2D mode was chosen, falling back to the desktop mode");
++      res = desktop;
++    }
++  }
++
+   const RESOLUTION_INFO chosen = CServiceBroker::GetWinSystem()->GetGfxContext().GetResInfo(res);
+   CLog::Log(LOGINFO, "Display resolution ADJUST : {}{} ({}) (weight: {:.3f})", chosen.strMode,
+             chosen.StereoLayoutTag(), res, weight);
+@@ -392,14 +426,10 @@ void CResolutionUtils::FindResolutionFromWhitelist(float fps, int width, int hei
+   // 3D mode's doubled fPixelRatio is no longer compensated for by GetResInfo()
+   // once the GUI leaves the split mode, squeezing that eye to half the width.
+   //
+-  // Take the requested mode rather than the current one: SetStereoMode() is
+-  // deferred to the next flip, so a search triggered by the change itself - which
+-  // is exactly when the display mode has to be re-chosen - would otherwise still
+-  // see the mode being left behind.
++  // The requested mode, not the current one - see Wants2DOutput().
+   const RenderStereoMode stereoMode =
+       CServiceBroker::GetWinSystem()->GetGfxContext().GetNextStereoMode();
+-  const bool wants2D = !is3D || (stereoMode != RenderStereoMode::SPLIT_VERTICAL &&
+-                                 stereoMode != RenderStereoMode::SPLIT_HORIZONTAL);
++  const bool wants2D = Wants2DOutput(is3D);
+ 
+   // Flags a candidate has to share with the mode it is compared against below. For
+   // 2D output the 3D layout bits are dropped from both sides: GetResInfo() OR-s the

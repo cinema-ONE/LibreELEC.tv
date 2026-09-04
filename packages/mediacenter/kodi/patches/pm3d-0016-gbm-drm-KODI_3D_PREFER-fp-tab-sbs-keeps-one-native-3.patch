@@ -1,0 +1,37 @@
+From 45ba8241884958f36bcc9cd2770818aef95146d5 Mon Sep 17 00:00:00 2001
+From: cinemaONE <35371193+cinema-ONE@users.noreply.github.com>
+Date: Fri, 4 Sep 2026 19:45:42 +0200
+Subject: [PATCH 16/22] gbm/drm: KODI_3D_PREFER=fp|tab|sbs keeps one native 3D
+ layout (test knob)
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ xbmc/windowing/gbm/drm/DRMUtils.cpp | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/xbmc/windowing/gbm/drm/DRMUtils.cpp b/xbmc/windowing/gbm/drm/DRMUtils.cpp
+index 3e126295e5..56181b019c 100644
+--- a/xbmc/windowing/gbm/drm/DRMUtils.cpp
++++ b/xbmc/windowing/gbm/drm/DRMUtils.cpp
+@@ -882,6 +882,21 @@ std::vector<RESOLUTION_INFO> CDRMUtils::GetModes()
+         (mode->flags & DRM_MODE_FLAG_INTERLACE))
+       continue;
+ 
++    // KODI_3D_PREFER=fp|tab|sbs (environment) keeps only that native 3D layout, so the
++    // selection - which otherwise takes the largest, i.e. frame packing - lands on the
++    // transport wanted. A test knob until a setting exists for it.
++    static const char* const prefer3D = getenv("KODI_3D_PREFER");
++    const uint32_t layout = mode->flags & DRM_MODE_FLAG_3D_MASK;
++    if (prefer3D && layout != DRM_MODE_FLAG_3D_NONE)
++    {
++      const bool keep =
++          (strcmp(prefer3D, "fp") == 0 && layout == DRM_MODE_FLAG_3D_FRAME_PACKING) ||
++          (strcmp(prefer3D, "tab") == 0 && layout == DRM_MODE_FLAG_3D_TOP_AND_BOTTOM) ||
++          (strcmp(prefer3D, "sbs") == 0 && layout == DRM_MODE_FLAG_3D_SIDE_BY_SIDE_HALF);
++      if (!keep)
++        continue;
++    }
++
+     RESOLUTION_INFO res = GetResolutionInfo(mode);
+     res.strId = std::to_string(i);
+     resolutions.push_back(res);

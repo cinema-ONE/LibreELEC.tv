@@ -1,0 +1,1000 @@
+From 2eba771f818574fddb78e08c5224fdc58c389228 Mon Sep 17 00:00:00 2001
+From: albaintor <118518828+albaintor@users.noreply.github.com>
+Date: Wed, 26 Aug 2026 15:58:39 +0200
+Subject: [PATCH 22/22] Fixed 3D SBS subtitles in PGS format
+
+(cherry picked from commit 76ab7390cfd42b749d13ff55d595a4b8d25f32db)
+---
+ cmake/treedata/common/tests.txt               |   1 +
+ .../DVDCodecs/Overlay/CMakeLists.txt          |   4 +
+ .../DVDCodecs/Overlay/DVDOverlay.h            |  10 +
+ .../Overlay/DVDOverlayCodecFFmpeg.cpp         | 106 ++++++--
+ .../DVDCodecs/Overlay/DVDOverlayCodecFFmpeg.h |   4 +
+ .../Overlay/DVDOverlayCodecFFmpegUtils.cpp    | 200 +++++++++++++++
+ .../Overlay/DVDOverlayCodecFFmpegUtils.h      |  76 ++++++
+ .../Overlay/DVDOverlayStereoUtils.cpp         |  38 +++
+ .../DVDCodecs/Overlay/DVDOverlayStereoUtils.h |  29 +++
+ .../DVDCodecs/Overlay/test/CMakeLists.txt     |   4 +
+ .../test/TestDVDOverlayCodecFFmpegUtils.cpp   | 230 ++++++++++++++++++
+ .../test/TestDVDOverlayStereoUtils.cpp        |  63 +++++
+ .../VideoRenderers/OverlayRenderer.cpp        |   8 +
+ 13 files changed, 756 insertions(+), 17 deletions(-)
+ create mode 100644 xbmc/cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlayCodecFFmpegUtils.cpp
+ create mode 100644 xbmc/cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlayCodecFFmpegUtils.h
+ create mode 100644 xbmc/cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlayStereoUtils.cpp
+ create mode 100644 xbmc/cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlayStereoUtils.h
+ create mode 100644 xbmc/cores/VideoPlayer/DVDCodecs/Overlay/test/CMakeLists.txt
+ create mode 100644 xbmc/cores/VideoPlayer/DVDCodecs/Overlay/test/TestDVDOverlayCodecFFmpegUtils.cpp
+ create mode 100644 xbmc/cores/VideoPlayer/DVDCodecs/Overlay/test/TestDVDOverlayStereoUtils.cpp
+
+diff --git a/cmake/treedata/common/tests.txt b/cmake/treedata/common/tests.txt
+index 9a96ae55a4..c539725241 100644
+--- a/cmake/treedata/common/tests.txt
++++ b/cmake/treedata/common/tests.txt
+@@ -4,6 +4,7 @@ xbmc/cores/AudioEngine/Sinks/test test/audioengine_sinks
+ xbmc/cores/VideoPlayer/Buffers/test test/videoplayer_buffers
+ xbmc/cores/VideoPlayer/test       test/videoplayer
+ xbmc/cores/VideoPlayer/DVDDemuxers/test test/dvddemuxers
++xbmc/cores/VideoPlayer/DVDCodecs/Overlay/test test/dvdoverlaycodecs
+ xbmc/cores/VideoPlayer/Edl/test   test/edl
+ xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/test test/videoshaders
+ xbmc/dbwrappers/test              test/dbwrappers
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/CMakeLists.txt b/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/CMakeLists.txt
+index 666b3bca26..f8c71c6caa 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/CMakeLists.txt
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/CMakeLists.txt
+@@ -1,5 +1,7 @@
+ set(SOURCES DVDOverlayCodec.cpp
+             DVDOverlayCodecFFmpeg.cpp
++            DVDOverlayCodecFFmpegUtils.cpp
++            DVDOverlayStereoUtils.cpp
+             DVDOverlayCodecSSA.cpp
+             DVDOverlayCodecText.cpp
+             DVDOverlayCodecCCText.cpp
+@@ -11,6 +13,8 @@ set(SOURCES DVDOverlayCodec.cpp
+ set(HEADERS DVDOverlay.h
+             DVDOverlayCodec.h
+             DVDOverlayCodecFFmpeg.h
++            DVDOverlayCodecFFmpegUtils.h
++            DVDOverlayStereoUtils.h
+             DVDOverlayCodecSSA.h
+             DVDOverlayCodecTX3G.h
+             DVDOverlayCodecText.h
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlay.h b/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlay.h
+index d816718143..45081e1208 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlay.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlay.h
+@@ -22,6 +22,13 @@ enum DVDOverlayType
+   DVDOVERLAY_TYPE_GROUP   = 5,
+ };
+ 
++enum class DVDOverlayStereoView
++{
++  BOTH,
++  LEFT,
++  RIGHT,
++};
++
+ class CDVDOverlay : public std::enable_shared_from_this<CDVDOverlay>
+ {
+ public:
+@@ -38,6 +45,7 @@ public:
+     m_overlayContainerFlushable = true;
+     m_setForcedMargins = false;
+     m_isBitmapSubtitle = false;
++    m_stereoView = DVDOverlayStereoView::BOTH;
+   }
+ 
+   CDVDOverlay(const CDVDOverlay& src) : std::enable_shared_from_this<CDVDOverlay>(src)
+@@ -52,6 +60,7 @@ public:
+     m_overlayContainerFlushable = src.m_overlayContainerFlushable;
+     m_setForcedMargins = src.m_setForcedMargins;
+     m_isBitmapSubtitle = src.m_isBitmapSubtitle;
++    m_stereoView = src.m_stereoView;
+   }
+ 
+   virtual ~CDVDOverlay() = default;
+@@ -117,6 +126,7 @@ public:
+   bool bForced; // display, no matter what
+   bool replace; // replace by next nomatter what stoptime it has
+   unsigned long m_textureid;
++  DVDOverlayStereoView m_stereoView;
+ 
+ protected:
+   DVDOverlayType m_type;
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlayCodecFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlayCodecFFmpeg.cpp
+index b862ceaec9..5eb8a6d241 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlayCodecFFmpeg.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlayCodecFFmpeg.cpp
+@@ -8,9 +8,12 @@
+ 
+ #include "DVDOverlayCodecFFmpeg.h"
+ 
++#include "DVDOverlayCodecFFmpegUtils.h"
+ #include "DVDOverlayImage.h"
++#include "DVDOverlayStereoUtils.h"
+ #include "DVDStreamInfo.h"
+ #include "ServiceBroker.h"
++#include "cores/DataCacheCore.h"
+ #include "cores/FFmpeg.h"
+ #include "cores/VideoPlayer/Interface/DemuxPacket.h"
+ #include "cores/VideoPlayer/Interface/TimingConstants.h"
+@@ -19,6 +22,40 @@
+ #include "windowing/GraphicContext.h"
+ #include "windowing/WinSystem.h"
+ 
++#include <cstddef>
++#include <utility>
++
++using namespace KODI::VIDEO::SUBTITLES;
++
++namespace
++{
++std::shared_ptr<CDVDOverlayImage> CropStereoView(const CDVDOverlayImage& source,
++                                                 BitmapStereoLayout layout,
++                                                 DVDOverlayStereoView view)
++{
++  BitmapSubtitle bitmap;
++  bitmap.x = source.x;
++  bitmap.y = source.y;
++  bitmap.width = source.width;
++  bitmap.height = source.height;
++  bitmap.sourceWidth = source.source_width;
++  bitmap.sourceHeight = source.source_height;
++
++  const BitmapStereoCrop crop = GetStereoCrop(bitmap, layout, view == DVDOverlayStereoView::RIGHT);
++  if (crop.IsEmpty())
++    return nullptr;
++
++  auto cropped = std::make_shared<CDVDOverlayImage>(source, crop.packedX, crop.packedY, crop.width,
++                                                    crop.height);
++  cropped->x = crop.x;
++  cropped->y = crop.y;
++  cropped->source_width = crop.sourceWidth;
++  cropped->source_height = crop.sourceHeight;
++  cropped->m_stereoView = view;
++  return cropped;
++}
++} // unnamed namespace
++
+ CDVDOverlayCodecFFmpeg::CDVDOverlayCodecFFmpeg() : CDVDOverlayCodec("FFmpeg Subtitle Decoder")
+ {
+   m_pCodecContext = NULL;
+@@ -187,6 +224,7 @@ OverlayMessage CDVDOverlayCodecFFmpeg::Decode(DemuxPacket* pPacket)
+     m_StopTime += pts_offset;
+ 
+   m_SubtitleIndex = 0;
++  m_pendingOverlay.reset();
+ 
+   return OverlayMessage::OC_OVERLAY;
+ }
+@@ -200,12 +238,18 @@ void CDVDOverlayCodecFFmpeg::Flush()
+ {
+   avsubtitle_free(&m_Subtitle);
+   m_SubtitleIndex = -1;
++  m_pendingOverlay.reset();
+ 
+   avcodec_flush_buffers(m_pCodecContext);
+ }
+ 
+ std::shared_ptr<CDVDOverlay> CDVDOverlayCodecFFmpeg::GetOverlay()
+ {
++  if (m_pendingOverlay)
++  {
++    return std::exchange(m_pendingOverlay, nullptr);
++  }
++
+   if(m_SubtitleIndex<0)
+     return nullptr;
+ 
+@@ -248,23 +292,6 @@ std::shared_ptr<CDVDOverlay> CDVDOverlayCodecFFmpeg::GetOverlay()
+       }
+     }
+ 
+-    RenderStereoMode render_stereo_mode =
+-        CServiceBroker::GetWinSystem()->GetGfxContext().GetStereoMode();
+-    if (render_stereo_mode != RenderStereoMode::OFF &&
+-        render_stereo_mode != RenderStereoMode::HARDWAREBASED)
+-    {
+-      if (rect.h > m_height / 2)
+-      {
+-        m_height /= 2;
+-        rect.h /= 2;
+-      }
+-      else if (rect.w > m_width / 2)
+-      {
+-        m_width /= 2;
+-        rect.w /= 2;
+-      }
+-    }
+-
+     auto overlay = std::make_shared<CDVDOverlayImage>();
+ 
+     overlay->iPTSStartTime = m_StartTime;
+@@ -299,6 +326,51 @@ std::shared_ptr<CDVDOverlay> CDVDOverlayCodecFFmpeg::GetOverlay()
+     for (int i = 0; i < rect.nb_colors; i++)
+       overlay->palette[i] = Endian_SwapLE32(((uint32_t *)rect.data[1])[i]);
+ 
++    // CProcessInfo would be the natural owner of the source stereo layout, but it is not
++    // accessible from an overlay codec. DataCacheCore provides the video player's thread-safe
++    // copy instead.
++    const BitmapStereoLayout layout =
++        GetBitmapStereoLayout(CServiceBroker::GetDataCacheCore().GetVideoStereoMode());
++    const RenderStereoMode renderMode =
++        CServiceBroker::GetWinSystem()->GetGfxContext().GetStereoMode();
++    if (IsStereoscopicOutputMode(renderMode) && layout != BitmapStereoLayout::MONO &&
++        !overlay->palette.empty())
++    {
++      BitmapSubtitle bitmap;
++      bitmap.pixels = overlay->pixels.data();
++      bitmap.stride = overlay->linesize;
++      bitmap.x = overlay->x;
++      bitmap.y = overlay->y;
++      bitmap.width = overlay->width;
++      bitmap.height = overlay->height;
++      bitmap.sourceWidth = overlay->source_width;
++      bitmap.sourceHeight = overlay->source_height;
++      for (std::size_t i = 0; i < overlay->palette.size() && i < bitmap.palette.size(); ++i)
++      {
++        const uint32_t color = overlay->palette[i];
++        if (((color >> PIXEL_ASHIFT) & 0xff) != 0)
++          bitmap.palette[i] = color;
++      }
++
++      if (IsStereoBitmap(bitmap, layout))
++      {
++        auto left = CropStereoView(*overlay, layout, DVDOverlayStereoView::LEFT);
++        auto right = CropStereoView(*overlay, layout, DVDOverlayStereoView::RIGHT);
++        if (left && right)
++        {
++          if (!m_loggedStereoSplit)
++          {
++            m_loggedStereoSplit = true;
++            CLog::Log(LOGDEBUG, "{} - splitting {} packed stereoscopic subtitle", __FUNCTION__,
++                      layout == BitmapStereoLayout::LEFT_RIGHT ? "side-by-side" : "top-and-bottom");
++          }
++          m_pendingOverlay = std::move(right);
++          m_SubtitleIndex++;
++          return left;
++        }
++      }
++    }
++
+     m_SubtitleIndex++;
+ 
+     return overlay;
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlayCodecFFmpeg.h b/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlayCodecFFmpeg.h
+index 36b5ed8199..9c992d5201 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlayCodecFFmpeg.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlayCodecFFmpeg.h
+@@ -15,6 +15,8 @@ extern "C" {
+ #include <libavutil/avutil.h>
+ }
+ 
++#include <memory>
++
+ class CDVDOverlaySpu;
+ class CDVDOverlayText;
+ 
+@@ -38,4 +40,6 @@ private:
+ 
+   int             m_width;
+   int             m_height;
++  std::shared_ptr<CDVDOverlay> m_pendingOverlay;
++  bool m_loggedStereoSplit{false};
+ };
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlayCodecFFmpegUtils.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlayCodecFFmpegUtils.cpp
+new file mode 100644
+index 0000000000..774440989b
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlayCodecFFmpegUtils.cpp
+@@ -0,0 +1,200 @@
++/*
++ *  Copyright (C) 2005-2026 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "DVDOverlayCodecFFmpegUtils.h"
++
++#include <algorithm>
++#include <cstddef>
++
++namespace KODI::VIDEO::SUBTITLES
++{
++namespace
++{
++struct Bounds
++{
++  int x1{0};
++  int y1{0};
++  int x2{0};
++  int y2{0};
++
++  bool IsEmpty() const { return x1 >= x2 || y1 >= y2; }
++  int Width() const { return x2 - x1; }
++  int Height() const { return y2 - y1; }
++};
++
++uint32_t GetPixel(const BitmapSubtitle& bitmap, int x, int y)
++{
++  const auto index = bitmap.pixels[(y - bitmap.y) * bitmap.stride + (x - bitmap.x)];
++  return bitmap.palette[index];
++}
++
++Bounds GetVisibleBounds(const BitmapSubtitle& bitmap, const Bounds& region)
++{
++  const int x1 = std::max(bitmap.x, region.x1);
++  const int y1 = std::max(bitmap.y, region.y1);
++  const int x2 = std::min(bitmap.x + bitmap.width, region.x2);
++  const int y2 = std::min(bitmap.y + bitmap.height, region.y2);
++  if (x1 >= x2 || y1 >= y2)
++    return {};
++
++  Bounds visible{x2, y2, x1, y1};
++  for (int y = y1; y < y2; ++y)
++  {
++    for (int x = x1; x < x2; ++x)
++    {
++      if (GetPixel(bitmap, x, y) == 0)
++        continue;
++
++      visible.x1 = std::min(visible.x1, x);
++      visible.y1 = std::min(visible.y1, y);
++      visible.x2 = std::max(visible.x2, x + 1);
++      visible.y2 = std::max(visible.y2, y + 1);
++    }
++  }
++  return visible;
++}
++
++bool HaveCompatiblePositions(const Bounds& first,
++                             const Bounds& second,
++                             const Bounds& firstRegion,
++                             const Bounds& secondRegion)
++{
++  const int firstX = first.x1 - firstRegion.x1;
++  const int firstY = first.y1 - firstRegion.y1;
++  const int secondX = second.x1 - secondRegion.x1;
++  const int secondY = second.y1 - secondRegion.y1;
++
++  // Stereo depth shifts the two copies horizontally. A small vertical tolerance accounts for
++  // rounding, while the horizontal limit prevents a repeated monoscopic caption around the
++  // split boundary from being mistaken for two eye images.
++  const int maxHorizontalShift = std::max(2, firstRegion.Width() / 8);
++  const int maxVerticalShift = std::max(2, firstRegion.Height() / 100);
++  return std::abs(firstX - secondX) <= maxHorizontalShift &&
++         std::abs(firstY - secondY) <= maxVerticalShift;
++}
++} // unnamed namespace
++
++BitmapStereoLayout GetBitmapStereoLayout(std::string_view stereoMode)
++{
++  if (stereoMode == "left_right" || stereoMode == "right_left")
++    return BitmapStereoLayout::LEFT_RIGHT;
++  if (stereoMode == "top_bottom" || stereoMode == "bottom_top")
++    return BitmapStereoLayout::TOP_BOTTOM;
++  return BitmapStereoLayout::MONO;
++}
++
++bool IsStereoBitmap(const BitmapSubtitle& bitmap, BitmapStereoLayout layout)
++{
++  if (!bitmap.pixels || bitmap.stride < bitmap.width || bitmap.width <= 0 || bitmap.height <= 0 ||
++      bitmap.sourceWidth <= 0 || bitmap.sourceHeight <= 0)
++    return false;
++
++  Bounds first;
++  Bounds second;
++  if (layout == BitmapStereoLayout::LEFT_RIGHT)
++  {
++    if (bitmap.sourceWidth % 2 != 0)
++      return false;
++
++    const int split = bitmap.sourceWidth / 2;
++    if (bitmap.x >= split || bitmap.x + bitmap.width <= split)
++      return false;
++    first = {0, 0, split, bitmap.sourceHeight};
++    second = {split, 0, bitmap.sourceWidth, bitmap.sourceHeight};
++  }
++  else if (layout == BitmapStereoLayout::TOP_BOTTOM)
++  {
++    if (bitmap.sourceHeight % 2 != 0)
++      return false;
++
++    const int split = bitmap.sourceHeight / 2;
++    if (bitmap.y >= split || bitmap.y + bitmap.height <= split)
++      return false;
++    first = {0, 0, bitmap.sourceWidth, split};
++    second = {0, split, bitmap.sourceWidth, bitmap.sourceHeight};
++  }
++  else
++    return false;
++
++  const Bounds firstRegion = first;
++  const Bounds secondRegion = second;
++  first = GetVisibleBounds(bitmap, firstRegion);
++  second = GetVisibleBounds(bitmap, secondRegion);
++  if (first.IsEmpty() || second.IsEmpty() || first.Width() != second.Width() ||
++      first.Height() != second.Height() ||
++      !HaveCompatiblePositions(first, second, firstRegion, secondRegion))
++    return false;
++
++  std::size_t comparedPixels = 0;
++  std::size_t mismatchedPixels = 0;
++  for (int y = 0; y < first.Height(); ++y)
++  {
++    for (int x = 0; x < first.Width(); ++x)
++    {
++      const uint32_t firstPixel = GetPixel(bitmap, first.x1 + x, first.y1 + y);
++      const uint32_t secondPixel = GetPixel(bitmap, second.x1 + x, second.y1 + y);
++      if (firstPixel == 0 && secondPixel == 0)
++        continue;
++
++      ++comparedPixels;
++      if (firstPixel != secondPixel)
++        ++mismatchedPixels;
++    }
++  }
++
++  // The packed images produced by subtitle conversion tools are normally identical. Keep a
++  // small tolerance for palette conversion or rounding differences while rejecting ordinary
++  // wide captions that merely cross the boundary between the two views.
++  return comparedPixels > 0 && mismatchedPixels * 100 <= comparedPixels;
++}
++
++BitmapStereoCrop GetStereoCrop(const BitmapSubtitle& bitmap,
++                               BitmapStereoLayout layout,
++                               bool secondView)
++{
++  if (bitmap.width <= 0 || bitmap.height <= 0 || bitmap.sourceWidth <= 0 ||
++      bitmap.sourceHeight <= 0)
++    return {};
++
++  int regionX{0};
++  int regionY{0};
++  int regionWidth{bitmap.sourceWidth};
++  int regionHeight{bitmap.sourceHeight};
++
++  if (layout == BitmapStereoLayout::LEFT_RIGHT && bitmap.sourceWidth % 2 == 0)
++  {
++    regionWidth /= 2;
++    if (secondView)
++      regionX = regionWidth;
++  }
++  else if (layout == BitmapStereoLayout::TOP_BOTTOM && bitmap.sourceHeight % 2 == 0)
++  {
++    regionHeight /= 2;
++    if (secondView)
++      regionY = regionHeight;
++  }
++  else
++    return {};
++
++  const int cropX = std::max(bitmap.x, regionX);
++  const int cropY = std::max(bitmap.y, regionY);
++  const int cropRight = std::min(bitmap.x + bitmap.width, regionX + regionWidth);
++  const int cropBottom = std::min(bitmap.y + bitmap.height, regionY + regionHeight);
++  if (cropX >= cropRight || cropY >= cropBottom)
++    return {};
++
++  return {cropX,
++          cropY,
++          cropX - regionX,
++          cropY - regionY,
++          cropRight - cropX,
++          cropBottom - cropY,
++          regionWidth,
++          regionHeight};
++}
++} // namespace KODI::VIDEO::SUBTITLES
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlayCodecFFmpegUtils.h b/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlayCodecFFmpegUtils.h
+new file mode 100644
+index 0000000000..97f70d46ef
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlayCodecFFmpegUtils.h
+@@ -0,0 +1,76 @@
++/*
++ *  Copyright (C) 2005-2026 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include <array>
++#include <cstdint>
++#include <string_view>
++
++namespace KODI::VIDEO::SUBTITLES
++{
++enum class BitmapStereoLayout
++{
++  MONO,
++  LEFT_RIGHT,
++  TOP_BOTTOM,
++};
++
++struct BitmapSubtitle
++{
++  const uint8_t* pixels{nullptr};
++  int stride{0};
++  int x{0};
++  int y{0};
++  int width{0};
++  int height{0};
++  int sourceWidth{0};
++  int sourceHeight{0};
++
++  // Fully transparent entries must be normalized to zero by the caller.
++  std::array<uint32_t, 256> palette{};
++};
++
++struct BitmapStereoCrop
++{
++  // Coordinates in the original packed subtitle bitmap, used to copy pixels.
++  int packedX{0};
++  int packedY{0};
++
++  // Coordinates and canvas size in the selected eye view.
++  int x{0};
++  int y{0};
++  int width{0};
++  int height{0};
++  int sourceWidth{0};
++  int sourceHeight{0};
++
++  bool IsEmpty() const { return width <= 0 || height <= 0; }
++};
++
++/*!
++ * \brief Return the packed bitmap layout described by a video stream stereo mode.
++ */
++BitmapStereoLayout GetBitmapStereoLayout(std::string_view stereoMode);
++
++/*!
++ * \brief Check whether a bitmap contains matching subtitle images in both packed views.
++ *
++ * The images may be shifted relative to each other to encode stereoscopic depth. Transparent
++ * borders are therefore removed independently before the two images are compared.
++ */
++bool IsStereoBitmap(const BitmapSubtitle& bitmap, BitmapStereoLayout layout);
++
++/*!
++ * \brief Return the exact intersection of a packed subtitle bitmap with one eye view.
++ * \param secondView False for the left/top view, true for the right/bottom view.
++ */
++BitmapStereoCrop GetStereoCrop(const BitmapSubtitle& bitmap,
++                               BitmapStereoLayout layout,
++                               bool secondView);
++} // namespace KODI::VIDEO::SUBTITLES
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlayStereoUtils.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlayStereoUtils.cpp
+new file mode 100644
+index 0000000000..3827c1166a
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlayStereoUtils.cpp
+@@ -0,0 +1,38 @@
++/*
++ *  Copyright (C) 2005-2026 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "DVDOverlayStereoUtils.h"
++
++namespace KODI::VIDEO::SUBTITLES
++{
++bool IsStereoscopicOutputMode(RenderStereoMode renderMode)
++{
++  return renderMode != RenderStereoMode::OFF && renderMode != RenderStereoMode::HARDWAREBASED;
++}
++
++bool ShouldRenderStereoOverlay(DVDOverlayStereoView overlayView,
++                               RenderStereoView renderView,
++                               std::string_view sourceStereoMode)
++{
++  if (overlayView == DVDOverlayStereoView::BOTH)
++    return true;
++
++  if (sourceStereoMode == "right_left" || sourceStereoMode == "bottom_top")
++  {
++    if (renderView == RenderStereoView::LEFT)
++      renderView = RenderStereoView::RIGHT;
++    else if (renderView == RenderStereoView::RIGHT)
++      renderView = RenderStereoView::LEFT;
++  }
++
++  if (renderView == RenderStereoView::OFF)
++    return overlayView == DVDOverlayStereoView::LEFT;
++
++  return (overlayView == DVDOverlayStereoView::LEFT) == (renderView == RenderStereoView::LEFT);
++}
++} // namespace KODI::VIDEO::SUBTITLES
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlayStereoUtils.h b/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlayStereoUtils.h
+new file mode 100644
+index 0000000000..0354b11fc4
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlayStereoUtils.h
+@@ -0,0 +1,29 @@
++/*
++ *  Copyright (C) 2005-2026 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include "DVDOverlay.h"
++#include "rendering/RenderSystemTypes.h"
++
++#include <string_view>
++
++namespace KODI::VIDEO::SUBTITLES
++{
++/*!
++ * \brief Whether the selected output mode separates stereoscopic eye views.
++ */
++bool IsStereoscopicOutputMode(RenderStereoMode renderMode);
++
++/*!
++ * \brief Whether an eye-specific overlay should be rendered in the current view.
++ */
++bool ShouldRenderStereoOverlay(DVDOverlayStereoView overlayView,
++                               RenderStereoView renderView,
++                               std::string_view sourceStereoMode);
++} // namespace KODI::VIDEO::SUBTITLES
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/test/CMakeLists.txt b/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/test/CMakeLists.txt
+new file mode 100644
+index 0000000000..2a34285429
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/test/CMakeLists.txt
+@@ -0,0 +1,4 @@
++set(SOURCES TestDVDOverlayCodecFFmpegUtils.cpp
++            TestDVDOverlayStereoUtils.cpp)
++
++core_add_test_library(dvdoverlaycodecs_test)
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/test/TestDVDOverlayCodecFFmpegUtils.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/test/TestDVDOverlayCodecFFmpegUtils.cpp
+new file mode 100644
+index 0000000000..9ba64b2621
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/test/TestDVDOverlayCodecFFmpegUtils.cpp
+@@ -0,0 +1,230 @@
++/*
++ *  Copyright (C) 2005-2026 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlayCodecFFmpegUtils.h"
++
++#include <cstdint>
++#include <vector>
++
++#include <gtest/gtest.h>
++
++using namespace KODI::VIDEO::SUBTITLES;
++
++namespace
++{
++class TestBitmap
++{
++public:
++  TestBitmap(int sourceWidth, int sourceHeight, int x, int y, int width, int height)
++    : m_pixels(width * height),
++      m_bitmap{m_pixels.data(), width, x, y, width, height, sourceWidth, sourceHeight}
++  {
++    m_bitmap.palette[1] = 0xffffffff;
++    m_bitmap.palette[2] = 0xff00ff00;
++  }
++
++  void SetPixel(int x, int y, uint8_t color)
++  {
++    m_pixels[(y - m_bitmap.y) * m_bitmap.stride + x - m_bitmap.x] = color;
++  }
++
++  void SetPattern(int x, int y)
++  {
++    SetPixel(x, y, 1);
++    SetPixel(x + 1, y, 2);
++    SetPixel(x, y + 1, 2);
++    SetPixel(x + 1, y + 1, 1);
++  }
++
++  const BitmapSubtitle& Get() const { return m_bitmap; }
++
++private:
++  std::vector<uint8_t> m_pixels;
++  BitmapSubtitle m_bitmap;
++};
++
++void FillPairWithMismatches(TestBitmap& bitmap, int mismatches)
++{
++  for (int y = 1; y < 11; ++y)
++  {
++    for (int x = 0; x < 20; ++x)
++    {
++      bitmap.SetPixel(2 + x, y, 1);
++      bitmap.SetPixel(37 + x, y, 1);
++    }
++  }
++
++  for (int i = 0; i < mismatches; ++i)
++    bitmap.SetPixel(37 + (i % 20), 1 + (i / 20), 2);
++}
++} // unnamed namespace
++
++TEST(TestDVDOverlayCodecFFmpegUtils, DetectsShiftedSideBySideImages)
++{
++  TestBitmap bitmap(16, 6, 1, 1, 12, 2);
++  bitmap.SetPattern(1, 1);
++  bitmap.SetPattern(11, 1);
++
++  EXPECT_TRUE(IsStereoBitmap(bitmap.Get(), BitmapStereoLayout::LEFT_RIGHT));
++  EXPECT_FALSE(IsStereoBitmap(bitmap.Get(), BitmapStereoLayout::TOP_BOTTOM));
++}
++
++TEST(TestDVDOverlayCodecFFmpegUtils, DetectsShiftedTopBottomImages)
++{
++  TestBitmap bitmap(8, 12, 2, 1, 4, 8);
++  bitmap.SetPattern(2, 1);
++  bitmap.SetPattern(4, 7);
++
++  EXPECT_TRUE(IsStereoBitmap(bitmap.Get(), BitmapStereoLayout::TOP_BOTTOM));
++  EXPECT_FALSE(IsStereoBitmap(bitmap.Get(), BitmapStereoLayout::LEFT_RIGHT));
++}
++
++TEST(TestDVDOverlayCodecFFmpegUtils, RejectsWideMonoscopicCaption)
++{
++  TestBitmap bitmap(16, 6, 2, 1, 12, 2);
++  bitmap.SetPattern(5, 1);
++  bitmap.SetPattern(9, 1);
++  bitmap.SetPixel(9, 1, 2);
++
++  EXPECT_FALSE(IsStereoBitmap(bitmap.Get(), BitmapStereoLayout::LEFT_RIGHT));
++}
++
++TEST(TestDVDOverlayCodecFFmpegUtils, RejectsCenteredRepeatedMonoscopicCaption)
++{
++  TestBitmap bitmap(16, 6, 2, 1, 12, 2);
++  bitmap.SetPattern(5, 1);
++  bitmap.SetPattern(9, 1);
++
++  EXPECT_FALSE(IsStereoBitmap(bitmap.Get(), BitmapStereoLayout::LEFT_RIGHT));
++}
++
++TEST(TestDVDOverlayCodecFFmpegUtils, RejectsCaptionInsideOneView)
++{
++  TestBitmap bitmap(16, 6, 1, 1, 4, 2);
++  bitmap.SetPattern(1, 1);
++  bitmap.SetPattern(3, 1);
++
++  EXPECT_FALSE(IsStereoBitmap(bitmap.Get(), BitmapStereoLayout::LEFT_RIGHT));
++}
++
++TEST(TestDVDOverlayCodecFFmpegUtils, AcceptsPairAtTolerance)
++{
++  TestBitmap bitmap(64, 12, 2, 1, 60, 10);
++  FillPairWithMismatches(bitmap, 2);
++
++  EXPECT_TRUE(IsStereoBitmap(bitmap.Get(), BitmapStereoLayout::LEFT_RIGHT));
++}
++
++TEST(TestDVDOverlayCodecFFmpegUtils, RejectsPairOutsideTolerance)
++{
++  TestBitmap bitmap(64, 12, 2, 1, 60, 10);
++  FillPairWithMismatches(bitmap, 3);
++
++  EXPECT_FALSE(IsStereoBitmap(bitmap.Get(), BitmapStereoLayout::LEFT_RIGHT));
++}
++
++TEST(TestDVDOverlayCodecFFmpegUtils, UsesRealisticSideBySidePositionTolerance)
++{
++  TestBitmap accepted(1920, 1080, 400, 100, 1062, 2);
++  accepted.SetPattern(400, 100);
++  accepted.SetPattern(1460, 100);
++
++  TestBitmap rejected(1920, 1080, 400, 100, 1162, 2);
++  rejected.SetPattern(400, 100);
++  rejected.SetPattern(1560, 100);
++
++  EXPECT_TRUE(IsStereoBitmap(accepted.Get(), BitmapStereoLayout::LEFT_RIGHT));
++  EXPECT_FALSE(IsStereoBitmap(rejected.Get(), BitmapStereoLayout::LEFT_RIGHT));
++}
++
++TEST(TestDVDOverlayCodecFFmpegUtils, UsesRealisticTopBottomPositionTolerance)
++{
++  TestBitmap accepted(1920, 1080, 400, 200, 202, 546);
++  accepted.SetPattern(400, 200);
++  accepted.SetPattern(600, 744);
++
++  TestBitmap excessiveHorizontalShift(1920, 1080, 400, 200, 302, 546);
++  excessiveHorizontalShift.SetPattern(400, 200);
++  excessiveHorizontalShift.SetPattern(700, 744);
++
++  TestBitmap excessiveVerticalShift(1920, 1080, 400, 200, 202, 552);
++  excessiveVerticalShift.SetPattern(400, 200);
++  excessiveVerticalShift.SetPattern(600, 750);
++
++  EXPECT_TRUE(IsStereoBitmap(accepted.Get(), BitmapStereoLayout::TOP_BOTTOM));
++  EXPECT_FALSE(IsStereoBitmap(excessiveHorizontalShift.Get(), BitmapStereoLayout::TOP_BOTTOM));
++  EXPECT_FALSE(IsStereoBitmap(excessiveVerticalShift.Get(), BitmapStereoLayout::TOP_BOTTOM));
++}
++
++TEST(TestDVDOverlayCodecFFmpegUtils, DerivesLayoutFromVideoStereoMode)
++{
++  EXPECT_EQ(GetBitmapStereoLayout("left_right"), BitmapStereoLayout::LEFT_RIGHT);
++  EXPECT_EQ(GetBitmapStereoLayout("right_left"), BitmapStereoLayout::LEFT_RIGHT);
++  EXPECT_EQ(GetBitmapStereoLayout("top_bottom"), BitmapStereoLayout::TOP_BOTTOM);
++  EXPECT_EQ(GetBitmapStereoLayout("bottom_top"), BitmapStereoLayout::TOP_BOTTOM);
++  EXPECT_EQ(GetBitmapStereoLayout("mono"), BitmapStereoLayout::MONO);
++  EXPECT_EQ(GetBitmapStereoLayout("anaglyph_cyan_red"), BitmapStereoLayout::MONO);
++}
++
++TEST(TestDVDOverlayCodecFFmpegUtils, CropsAtPackedViewBoundary)
++{
++  BitmapSubtitle bitmap;
++  bitmap.x = 300;
++  bitmap.y = 100;
++  bitmap.width = 1300;
++  bitmap.height = 80;
++  bitmap.sourceWidth = 1920;
++  bitmap.sourceHeight = 1080;
++
++  const BitmapStereoCrop left = GetStereoCrop(bitmap, BitmapStereoLayout::LEFT_RIGHT, false);
++  EXPECT_EQ(left.packedX, 300);
++  EXPECT_EQ(left.x, 300);
++  EXPECT_EQ(left.width, 660);
++  EXPECT_EQ(left.sourceWidth, 960);
++
++  const BitmapStereoCrop right = GetStereoCrop(bitmap, BitmapStereoLayout::LEFT_RIGHT, true);
++  EXPECT_EQ(right.packedX, 960);
++  EXPECT_EQ(right.x, 0);
++  EXPECT_EQ(right.width, 640);
++  EXPECT_EQ(right.sourceWidth, 960);
++}
++
++TEST(TestDVDOverlayCodecFFmpegUtils, CropsAtPackedViewBoundaryTopBottom)
++{
++  BitmapSubtitle bitmap;
++  bitmap.x = 100;
++  bitmap.y = 400;
++  bitmap.width = 800;
++  bitmap.height = 300;
++  bitmap.sourceWidth = 1920;
++  bitmap.sourceHeight = 1080;
++
++  const BitmapStereoCrop top = GetStereoCrop(bitmap, BitmapStereoLayout::TOP_BOTTOM, false);
++  EXPECT_EQ(top.packedY, 400);
++  EXPECT_EQ(top.y, 400);
++  EXPECT_EQ(top.height, 140);
++  EXPECT_EQ(top.sourceHeight, 540);
++
++  const BitmapStereoCrop bottom = GetStereoCrop(bitmap, BitmapStereoLayout::TOP_BOTTOM, true);
++  EXPECT_EQ(bottom.packedY, 540);
++  EXPECT_EQ(bottom.y, 0);
++  EXPECT_EQ(bottom.height, 160);
++  EXPECT_EQ(bottom.sourceHeight, 540);
++}
++
++TEST(TestDVDOverlayCodecFFmpegUtils, RejectsOddCanvas)
++{
++  BitmapSubtitle bitmap;
++  bitmap.width = 100;
++  bitmap.height = 50;
++  bitmap.sourceWidth = 1921;
++  bitmap.sourceHeight = 1081;
++
++  EXPECT_TRUE(GetStereoCrop(bitmap, BitmapStereoLayout::LEFT_RIGHT, false).IsEmpty());
++  EXPECT_TRUE(GetStereoCrop(bitmap, BitmapStereoLayout::TOP_BOTTOM, false).IsEmpty());
++}
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/test/TestDVDOverlayStereoUtils.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/test/TestDVDOverlayStereoUtils.cpp
+new file mode 100644
+index 0000000000..219a299731
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/test/TestDVDOverlayStereoUtils.cpp
+@@ -0,0 +1,63 @@
++/*
++ *  Copyright (C) 2005-2026 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlayStereoUtils.h"
++
++#include <gtest/gtest.h>
++
++using namespace KODI::VIDEO::SUBTITLES;
++
++TEST(TestDVDOverlayStereoUtils, DetectsStereoscopicOutputModes)
++{
++  EXPECT_FALSE(IsStereoscopicOutputMode(RenderStereoMode::OFF));
++  EXPECT_FALSE(IsStereoscopicOutputMode(RenderStereoMode::HARDWAREBASED));
++  EXPECT_TRUE(IsStereoscopicOutputMode(RenderStereoMode::SPLIT_VERTICAL));
++  EXPECT_TRUE(IsStereoscopicOutputMode(RenderStereoMode::SPLIT_HORIZONTAL));
++  EXPECT_TRUE(IsStereoscopicOutputMode(RenderStereoMode::ANAGLYPH_RED_CYAN));
++  EXPECT_TRUE(IsStereoscopicOutputMode(RenderStereoMode::ANAGLYPH_GREEN_MAGENTA));
++  EXPECT_TRUE(IsStereoscopicOutputMode(RenderStereoMode::ANAGLYPH_YELLOW_BLUE));
++  EXPECT_TRUE(IsStereoscopicOutputMode(RenderStereoMode::INTERLACED));
++  EXPECT_TRUE(IsStereoscopicOutputMode(RenderStereoMode::CHECKERBOARD));
++  EXPECT_TRUE(IsStereoscopicOutputMode(RenderStereoMode::MONO));
++}
++
++TEST(TestDVDOverlayStereoUtils, SelectsEyeForLeftRightSource)
++{
++  EXPECT_TRUE(
++      ShouldRenderStereoOverlay(DVDOverlayStereoView::BOTH, RenderStereoView::LEFT, "left_right"));
++  EXPECT_TRUE(
++      ShouldRenderStereoOverlay(DVDOverlayStereoView::LEFT, RenderStereoView::LEFT, "left_right"));
++  EXPECT_FALSE(
++      ShouldRenderStereoOverlay(DVDOverlayStereoView::RIGHT, RenderStereoView::LEFT, "left_right"));
++  EXPECT_FALSE(
++      ShouldRenderStereoOverlay(DVDOverlayStereoView::LEFT, RenderStereoView::RIGHT, "left_right"));
++  EXPECT_TRUE(ShouldRenderStereoOverlay(DVDOverlayStereoView::RIGHT, RenderStereoView::RIGHT,
++                                        "left_right"));
++  EXPECT_TRUE(
++      ShouldRenderStereoOverlay(DVDOverlayStereoView::LEFT, RenderStereoView::LEFT, "top_bottom"));
++}
++
++TEST(TestDVDOverlayStereoUtils, SelectsEyeForReversedSource)
++{
++  EXPECT_FALSE(
++      ShouldRenderStereoOverlay(DVDOverlayStereoView::LEFT, RenderStereoView::LEFT, "right_left"));
++  EXPECT_TRUE(
++      ShouldRenderStereoOverlay(DVDOverlayStereoView::RIGHT, RenderStereoView::LEFT, "right_left"));
++  EXPECT_TRUE(
++      ShouldRenderStereoOverlay(DVDOverlayStereoView::LEFT, RenderStereoView::RIGHT, "bottom_top"));
++  EXPECT_FALSE(ShouldRenderStereoOverlay(DVDOverlayStereoView::RIGHT, RenderStereoView::RIGHT,
++                                         "bottom_top"));
++}
++
++TEST(TestDVDOverlayStereoUtils, SelectsFirstEyeWhenStereoViewIsOff)
++{
++  EXPECT_TRUE(
++      ShouldRenderStereoOverlay(DVDOverlayStereoView::LEFT, RenderStereoView::OFF, "left_right"));
++  EXPECT_FALSE(
++      ShouldRenderStereoOverlay(DVDOverlayStereoView::RIGHT, RenderStereoView::OFF, "left_right"));
++}
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.cpp
+index 3c0b3c0fa4..0fa78371d7 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.cpp
+@@ -17,6 +17,7 @@
+ #include "cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlayImage.h"
+ #include "cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlayLibass.h"
+ #include "cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlaySpu.h"
++#include "cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlayStereoUtils.h"
+ #include "guilib/GUIComponent.h"
+ #include "guilib/GUIWindowManager.h"
+ #include "settings/DisplaySettings.h"
+@@ -230,6 +231,9 @@ void CRenderer::Render(int idx, float depth)
+   std::vector<SRenderItem> items;
+   items.reserve(m_buffers[idx].size());
+ 
++  const RenderStereoView stereoView =
++      CServiceBroker::GetWinSystem()->GetGfxContext().GetStereoView();
++
+   for (auto& e : m_buffers[idx])
+   {
+     if (!e.overlay_dvd)
+@@ -239,6 +243,10 @@ void CRenderer::Render(int idx, float depth)
+     if (!o)
+       continue;
+ 
++    if (!KODI::VIDEO::SUBTITLES::ShouldRenderStereoOverlay(e.overlay_dvd->m_stereoView,
++                                                           stereoView, m_stereomode))
++      continue;
++
+     SRenderItem item;
+     GetRenderState(o.get(), item.state);
+     item.overlay = std::move(o);

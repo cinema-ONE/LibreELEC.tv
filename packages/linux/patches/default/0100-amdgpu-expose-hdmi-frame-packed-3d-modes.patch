@@ -1,45 +1,66 @@
-From: cinemaONE <35371193+cinema-ONE@users.noreply.github.com>
-Subject: [PATCH] drm/amd/display: expose HDMI frame-packed 3D modes
-
-amdgpu never allows stereo modes, so a sink's HDMI 3D modes are dropped by
-DRM before userspace sees them. DC already implements software frame
-packing (TIMING_3D_FORMAT_SW_FRAME_PACKING) and builds the HDMI 1.4 vendor
-infoframe with 3D_Structure = frame packing for it; the driver just never
-maps the DRM mode flag to it.
-
-Allow stereo on HDMI connectors, and when the mode carries
-DRM_MODE_FLAG_3D_FRAME_PACKING mark the stream as software frame packed
-with a frame-sequential view. The CRTC timing DRM computes for such a mode
-is already the doubled one (drm_mode_set_crtcinfo, CRTC_STEREO_DOUBLE),
-which is what SW_FRAME_PACKING expects; HW_FRAME_PACKING would double the
-pixel clock a second time and is not used.
-
-Experimental. Tested against Linux 7.2.3 on Navi 33 only.
----
- drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c | 11 ++++++++++-
- 1 file changed, 10 insertions(+), 1 deletion(-)
-
-diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
---- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
-+++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
-@@ -7014,7 +7014,15 @@ static void fill_stream_properties_from_drm_display_mode(
+diff -ruN /private/tmp/claude-501/-Users-adrian-code-xbmc-xbmc/6566a1a5-410d-46f0-9d20-045e0b642209/scratchpad/k723p/linux-7.2.3/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c linux-7.2.3/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c	2026-09-04 19:38:45
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c	2026-09-04 20:53:59
+@@ -7014,7 +7014,25 @@
  	else
  		timing_out->pixel_encoding = PIXEL_ENCODING_RGB;
  
 -	timing_out->timing_3d_format = TIMING_3D_FORMAT_NONE;
-+	if ((mode_in->flags & DRM_MODE_FLAG_3D_MASK) == DRM_MODE_FLAG_3D_FRAME_PACKING) {
-+		/* DRM already doubled the CRTC timing for this mode */
++	switch (mode_in->flags & DRM_MODE_FLAG_3D_MASK) {
++	case DRM_MODE_FLAG_3D_TOP_AND_BOTTOM:
++		timing_out->timing_3d_format = TIMING_3D_FORMAT_TOP_AND_BOTTOM;
++		stream->view_format = VIEW_3D_FORMAT_TOP_AND_BOTTOM;
++		break;
++	case DRM_MODE_FLAG_3D_SIDE_BY_SIDE_HALF:
++	case DRM_MODE_FLAG_3D_SIDE_BY_SIDE_FULL:
++		timing_out->timing_3d_format = TIMING_3D_FORMAT_SIDE_BY_SIDE;
++		stream->view_format = VIEW_3D_FORMAT_SIDE_BY_SIDE;
++		break;
++	case DRM_MODE_FLAG_3D_FRAME_PACKING:
 +		timing_out->timing_3d_format = TIMING_3D_FORMAT_SW_FRAME_PACKING;
 +		stream->view_format = VIEW_3D_FORMAT_FRAME_SEQUENTIAL;
-+	} else {
++		break;
++	default:
 +		timing_out->timing_3d_format = TIMING_3D_FORMAT_NONE;
 +		stream->view_format = VIEW_3D_FORMAT_NONE;
++		break;
 +	}
-+
  	timing_out->display_color_depth = convert_color_depth_from_display_info(
  		connector,
  		(timing_out->pixel_encoding == PIXEL_ENCODING_YCBCR420),
-@@ -9322,7 +9330,8 @@ static int amdgpu_dm_connector_init(struct amdgpu_display_manager *dm,
+@@ -7622,6 +7640,9 @@
+ 	struct dc_sink *sink = NULL;
+ 
+ 	drm_mode_init(&mode, drm_mode);
++	/* frame packing scans out the doubled timing (two eyes plus the gap) */
++	if (mode.flags & DRM_MODE_FLAG_3D_FRAME_PACKING)
++		drm_mode_set_crtcinfo(&mode, CRTC_STEREO_DOUBLE);
+ 	memset(&saved_mode, 0, sizeof(saved_mode));
+ 
+ 	if (connector->connector_type != DRM_MODE_CONNECTOR_WRITEBACK) {
+@@ -7701,7 +7722,9 @@
+ 	}
+ 
+ 	if (recalculate_timing)
+-		drm_mode_set_crtcinfo(&saved_mode, 0);
++		drm_mode_set_crtcinfo(&saved_mode,
++				      (saved_mode.flags & DRM_MODE_FLAG_3D_FRAME_PACKING) ?
++				      CRTC_STEREO_DOUBLE : 0);
+ 
+ 	/*
+ 	 * If scaling is enabled and refresh rate didn't change
+@@ -8566,7 +8589,9 @@
+ 	if (!test_mode)
+ 		goto fail;
+ 
+-	drm_mode_set_crtcinfo(test_mode, 0);
++	drm_mode_set_crtcinfo(test_mode,
++			      (test_mode->flags & DRM_MODE_FLAG_3D_FRAME_PACKING) ?
++			      CRTC_STEREO_DOUBLE : 0);
+ 
+ 	stream = create_validate_stream_for_sink(connector, test_mode,
+ 						 to_dm_connector_state(connector->state),
+@@ -9322,7 +9347,8 @@
  	aconnector->dc_link = link;
  	aconnector->base.interlace_allowed = false;
  	aconnector->base.doublescan_allowed = false;
@@ -49,3 +70,60 @@ diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm
  	aconnector->base.dpms = DRM_MODE_DPMS_OFF;
  	aconnector->hpd.hpd = AMDGPU_HPD_NONE; /* not used */
  	aconnector->audio_inst = -1;
+diff -ruN /private/tmp/claude-501/-Users-adrian-code-xbmc-xbmc/6566a1a5-410d-46f0-9d20-045e0b642209/scratchpad/k723p/linux-7.2.3/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_plane.c linux-7.2.3/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_plane.c
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_plane.c	2026-09-04 19:38:45
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_plane.c	2026-09-04 20:53:59
+@@ -1101,18 +1101,23 @@
+ 	if (fb && state->crtc) {
+ 		/* Validate viewport to cover the case when only the position changes */
+ 		if (state->plane->type != DRM_PLANE_TYPE_CURSOR) {
++			int mode_hdisplay, mode_vdisplay;
+ 			int viewport_width = state->crtc_w;
+ 			int viewport_height = state->crtc_h;
+ 
++			/* frame-packed 3D scans out the doubled timing */
++			drm_mode_get_hv_timing(&new_crtc_state->mode,
++					       &mode_hdisplay, &mode_vdisplay);
++
+ 			if (state->crtc_x < 0)
+ 				viewport_width += state->crtc_x;
+-			else if (state->crtc_x + state->crtc_w > new_crtc_state->mode.crtc_hdisplay)
+-				viewport_width = new_crtc_state->mode.crtc_hdisplay - state->crtc_x;
++			else if (state->crtc_x + state->crtc_w > mode_hdisplay)
++				viewport_width = mode_hdisplay - state->crtc_x;
+ 
+ 			if (state->crtc_y < 0)
+ 				viewport_height += state->crtc_y;
+-			else if (state->crtc_y + state->crtc_h > new_crtc_state->mode.crtc_vdisplay)
+-				viewport_height = new_crtc_state->mode.crtc_vdisplay - state->crtc_y;
++			else if (state->crtc_y + state->crtc_h > mode_vdisplay)
++				viewport_height = mode_vdisplay - state->crtc_y;
+ 
+ 			if (viewport_width < 0 || viewport_height < 0) {
+ 				DRM_DEBUG_ATOMIC("Plane completely outside of screen\n");
+diff -ruN /private/tmp/claude-501/-Users-adrian-code-xbmc-xbmc/6566a1a5-410d-46f0-9d20-045e0b642209/scratchpad/k723p/linux-7.2.3/drivers/gpu/drm/amd/display/dc/core/dc_resource.c linux-7.2.3/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_resource.c	2026-09-02 14:33:21
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_resource.c	2026-09-04 20:53:59
+@@ -4912,8 +4912,10 @@
+ 
+ 	switch (stream->content_type) {
+ 	case DISPLAY_CONTENT_TYPE_NO_DATA:
++		/* No content type set: do not flag the stream as IT content, so a
++		 * sink keeps its video processing (3D, motion, ...) enabled. */
+ 		hdmi_info.bits.CN0_CN1 = 0;
+-		hdmi_info.bits.ITC = 1;
++		hdmi_info.bits.ITC = 0;
+ 		break;
+ 	case DISPLAY_CONTENT_TYPE_GRAPHICS:
+ 		hdmi_info.bits.CN0_CN1 = 0;
+diff -ruN /private/tmp/claude-501/-Users-adrian-code-xbmc-xbmc/6566a1a5-410d-46f0-9d20-045e0b642209/scratchpad/k723p/linux-7.2.3/drivers/gpu/drm/amd/display/dc/optc/dcn10/dcn10_optc.c linux-7.2.3/drivers/gpu/drm/amd/display/dc/optc/dcn10/dcn10_optc.c
+--- a/drivers/gpu/drm/amd/display/dc/optc/dcn10/dcn10_optc.c	2026-09-04 19:38:45
++++ b/drivers/gpu/drm/amd/display/dc/optc/dcn10/dcn10_optc.c	2026-09-04 20:53:59
+@@ -608,6 +608,7 @@
+ 
+ 	if (timing->timing_3d_format != TIMING_3D_FORMAT_NONE &&
+ 		timing->timing_3d_format != TIMING_3D_FORMAT_HW_FRAME_PACKING &&
++		timing->timing_3d_format != TIMING_3D_FORMAT_SW_FRAME_PACKING &&
+ 		timing->timing_3d_format != TIMING_3D_FORMAT_TOP_AND_BOTTOM &&
+ 		timing->timing_3d_format != TIMING_3D_FORMAT_SIDE_BY_SIDE &&
+ 		timing->timing_3d_format != TIMING_3D_FORMAT_FRAME_ALTERNATE &&

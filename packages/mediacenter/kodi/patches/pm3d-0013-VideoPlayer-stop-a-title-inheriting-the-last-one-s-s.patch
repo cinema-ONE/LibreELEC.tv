@@ -1,0 +1,112 @@
+From 0f24eaed3e66f5ef8b3138612194163405d59cf9 Mon Sep 17 00:00:00 2001
+From: Dom Cobley <popcornmix@gmail.com>
+Date: Sun, 23 Aug 2026 11:32:43 +0100
+Subject: [PATCH 13/22] VideoPlayer: stop a title inheriting the last one's
+ stereoscopic mode
+
+Play a 2D video straight after a 3D one, without stopping in between, and the
+2D one is taken for 3D: the display is put into a stereoscopic mode and each
+half of the screen gets half the picture. Big Buck Bunny after a Blu-ray 3D
+title is enough to see it.
+
+The picture the decoder fills in belongs to the video player, not to the
+stream, and a decoder only writes the stereoscopic mode into it when the stream
+has views of its own to declare -- everything else is left to the fallback that
+looks at the video settings and the stream hints. That fallback only runs when
+the field is empty, which after a 3D title it is not, so the mode carries over
+and the fallback never gets the chance to say otherwise. Clear it when a stream
+is opened, on the thread that fills the picture in.
+
+Two more places describe the outgoing title and are read before the new one has
+said anything about itself, both because opening a file over the top of another
+never closes the player -- which is deliberate, and skipped only for a disc
+image or a DVD, neither of which a bluray:// path looks like. The video
+information the player publishes still describes the title that has gone, and
+so does the picture the render manager matches display modes against. Forget
+both, or the mode is chosen for the wrong title before the first frame of the
+right one arrives.
+
+(cherry picked from commit e011043b4fc830dc4143cf4630ae5a5a5bb8fef8)
+---
+ xbmc/cores/VideoPlayer/VideoPlayer.cpp                  | 9 +++++++++
+ xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp             | 6 ++++++
+ xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp | 9 +++++++++
+ xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.h   | 8 ++++++++
+ 4 files changed, 32 insertions(+)
+
+diff --git a/xbmc/cores/VideoPlayer/VideoPlayer.cpp b/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+index 0dd3644be8..9d8eaa1abf 100644
+--- a/xbmc/cores/VideoPlayer/VideoPlayer.cpp
++++ b/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+@@ -3018,6 +3018,15 @@ void CVideoPlayer::HandleMessages()
+ 
+       FlushBuffers(DVD_NOPTS_VALUE, true, true);
+       m_renderManager.Flush(false, false);
++
++      // Opening a file without closing the player leaves everything that described the
++      // last one behind, and it is answered for as if it were the new one until the new
++      // one has been read far enough to describe itself. A 2D title following a 3D one
++      // picks up its stereoscopic mode that way, and the display is put into a 3D mode
++      // for it.
++      m_processInfo->ResetVideoCodecInfo();
++      m_renderManager.ResetPictureInfo();
++
+       m_pDemuxer.reset();
+       m_pSubtitleDemuxer.reset();
+       m_subtitleDemuxerMap.clear();
+diff --git a/xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp b/xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp
+index 3721509af6..556f4049eb 100644
+--- a/xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp
++++ b/xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp
+@@ -232,6 +232,12 @@ void CVideoPlayerVideo::OpenStream(CDVDStreamInfo& hint, std::unique_ptr<CDVDVid
+ 
+   m_pVideoCodec = std::move(codec);
+   m_hints = hint;
++
++  // A decoder only fills this in when the stream has views of its own to declare, and
++  // the picture is reused from one stream to the next, so a stream without them would
++  // inherit what the last one left here and be taken for 3D.
++  m_picture.stereoMode.clear();
++
+   m_stalled = m_messageQueue.GetPacketCount(CDVDMsg::DEMUXER_PACKET) == 0;
+   m_rewindStalled = false;
+   m_packets.clear();
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
+index 1de1dedb49..12f61e49f9 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
+@@ -810,6 +810,15 @@ void CRenderManager::UpdateResolution()
+   }
+ }
+ 
++void CRenderManager::ResetPictureInfo()
++{
++  std::unique_lock lock(m_statelock);
++
++  m_picture.Reset();
++  m_fps = 0.0f;
++  m_bTriggerUpdateResolution = false;
++}
++
+ void CRenderManager::TriggerUpdateResolution(float fps, int width, int height, std::string &stereomode)
+ {
+   if (width)
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.h b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.h
+index d54a344b97..6a4acd73fb 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.h
+@@ -79,6 +79,14 @@ public:
+   RESOLUTION GetResolution();
+   void UpdateResolution();
+   void TriggerUpdateResolution(float fps, int width, int height, std::string &stereomode);
++
++  /*!
++   * \brief Forget what the outgoing title looked like.
++   *
++   * Configure() only replaces this once the new title has a picture to describe, and
++   * until then a resolution search would be answered for the title that has gone.
++   */
++  void ResetPictureInfo();
+   void SetViewMode(int iViewMode);
+   void PreInit();
+   void UnInit();

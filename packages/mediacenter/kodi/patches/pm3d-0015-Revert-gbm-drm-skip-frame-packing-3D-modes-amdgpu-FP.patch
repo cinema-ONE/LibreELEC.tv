@@ -1,0 +1,33 @@
+From 962d2be74c748fe088089b62990a80a3da370af1 Mon Sep 17 00:00:00 2001
+From: cinemaONE <35371193+cinema-ONE@users.noreply.github.com>
+Date: Fri, 4 Sep 2026 19:39:48 +0200
+Subject: [PATCH 15/22] Revert "gbm/drm: skip frame-packing 3D modes (amdgpu FP
+ hangs; force TAB)"
+
+This reverts commit 933b6d41fd706e7236e90dd9a2289c530483078e.
+---
+ xbmc/windowing/gbm/drm/DRMUtils.cpp | 11 +++++------
+ 1 file changed, 5 insertions(+), 6 deletions(-)
+
+diff --git a/xbmc/windowing/gbm/drm/DRMUtils.cpp b/xbmc/windowing/gbm/drm/DRMUtils.cpp
+index e9e3fbdded..3e126295e5 100644
+--- a/xbmc/windowing/gbm/drm/DRMUtils.cpp
++++ b/xbmc/windowing/gbm/drm/DRMUtils.cpp
+@@ -875,12 +875,11 @@ std::vector<RESOLUTION_INFO> CDRMUtils::GetModes()
+   {
+     drmModeModeInfoPtr mode = m_connector->GetModeForIndex(i);
+ 
+-    // Frame packing hangs amdgpu's atomic commit: DC does not double the CRTC
+-    // timing (unlike vc4), so a vdisplay+vtotal plane exceeds the CRTC. Skip all
+-    // frame-packing modes for now so the selection picks top-and-bottom, which
+-    // needs no doubling. strId stays the connector mode index (SetMode() looks
+-    // the mode up by it), so skip without renumbering.
+-    if ((mode->flags & DRM_MODE_FLAG_3D_MASK) == DRM_MODE_FLAG_3D_FRAME_PACKING)
++    // Interlaced frame packing cannot be driven from a progressive framebuffer;
++    // hide it so it is never picked for 3D playback. strId stays the connector
++    // mode index (SetMode() looks the mode up by it), so skip without renumbering.
++    if ((mode->flags & DRM_MODE_FLAG_3D_MASK) == DRM_MODE_FLAG_3D_FRAME_PACKING &&
++        (mode->flags & DRM_MODE_FLAG_INTERLACE))
+       continue;
+ 
+     RESOLUTION_INFO res = GetResolutionInfo(mode);

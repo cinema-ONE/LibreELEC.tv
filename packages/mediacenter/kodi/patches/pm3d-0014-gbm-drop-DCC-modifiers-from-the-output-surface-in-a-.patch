@@ -1,0 +1,119 @@
+From d26a277247a7ae92b856e17be0d766b0f1ac9cd5 Mon Sep 17 00:00:00 2001
+From: cinemaONE <35371193+cinema-ONE@users.noreply.github.com>
+Date: Fri, 4 Sep 2026 19:39:38 +0200
+Subject: [PATCH 14/22] gbm: drop DCC modifiers from the output surface in a
+ hardware 3D mode
+
+amdgpu cannot scan out a DCC-compressed framebuffer in a stereo timing: the
+first nonblocking flip after the 3D modeset never completes and the display
+pipe wedges (found by logging every atomic commit to disk). Keep the tiled
+modifiers, drop the DCC ones, whenever the DRM mode carries a 3D flag.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ xbmc/windowing/gbm/WinSystemGbmEGLContext.cpp | 58 ++++++++++++-------
+ xbmc/windowing/gbm/WinSystemGbmEGLContext.h   |  1 +
+ 2 files changed, 37 insertions(+), 22 deletions(-)
+
+diff --git a/xbmc/windowing/gbm/WinSystemGbmEGLContext.cpp b/xbmc/windowing/gbm/WinSystemGbmEGLContext.cpp
+index 6f19a9db3f..90cc5e671b 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmEGLContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmEGLContext.cpp
+@@ -8,6 +8,8 @@
+ 
+ #include "WinSystemGbmEGLContext.h"
+ 
++#include "windowing/GraphicContext.h"
++
+ #include "OptionalsReg.h"
+ #include "cores/VideoPlayer/DVDCodecs/DVDFactoryCodec.h"
+ #include "cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h"
+@@ -119,17 +121,8 @@ bool CWinSystemGbmEGLContext::CreateNewWindow(const std::string& name,
+   }
+ 
+   uint32_t format = m_eglContext.GetConfigAttrib(EGL_NATIVE_VISUAL_ID);
+-  std::vector<uint64_t> fallbackModifiers = {DRM_FORMAT_MOD_LINEAR};
+-  std::vector<uint64_t>* modifiers = &fallbackModifiers;
+-
+-  for (auto& fmt : m_DRM->GetOutputFormats())
+-  {
+-    if (fmt.drm == format && fmt.active)
+-    {
+-      modifiers = &fmt.modifiers;
+-      break;
+-    }
+-  }
++  std::vector<uint64_t> modifierList = OutputModifiers(format);
++  std::vector<uint64_t>* modifiers = &modifierList;
+ 
+   if (!m_GBM->GetDevice().CreateSurface(res.iWidth, res.iHeight, format, modifiers->data(),
+                                         modifiers->size()))
+@@ -194,6 +187,36 @@ bool CWinSystemGbmEGLContext::DestroyWindow()
+   return true;
+ }
+ 
++std::vector<uint64_t> CWinSystemGbmEGLContext::OutputModifiers(uint32_t format)
++{
++  std::vector<uint64_t> modifiers = {DRM_FORMAT_MOD_LINEAR};
++
++  for (auto& fmt : m_DRM->GetOutputFormats())
++  {
++    if (fmt.drm == format && fmt.active)
++    {
++      modifiers = fmt.modifiers;
++      break;
++    }
++  }
++
++#ifdef AMD_FMT_MOD_DCC_SHIFT
++  // amdgpu cannot scan out a DCC-compressed buffer in a stereo timing: the first
++  // flip in a 3D mode never completes and the display pipe wedges. Keep the tiled
++  // modifiers and drop the DCC ones whenever the DRM mode carries a 3D flag.
++  const RESOLUTION_INFO mode = m_DRM->GetCurrentMode();
++  if (mode.dwFlags & (D3DPRESENTFLAG_MODE3DTB | D3DPRESENTFLAG_MODE3DSBS))
++  {
++    std::erase_if(modifiers,
++                  [](uint64_t mod) { return IS_AMD_FMT_MOD(mod) && AMD_FMT_MOD_GET(DCC, mod); });
++    if (modifiers.empty())
++      modifiers.push_back(DRM_FORMAT_MOD_LINEAR);
++  }
++#endif
++
++  return modifiers;
++}
++
+ bool CWinSystemGbmEGLContext::SetVideoOutput(const VideoPicture* videoPicture)
+ {
+   // Override: the base only flips the gui/video plane role. On EGL
+@@ -221,17 +244,8 @@ bool CWinSystemGbmEGLContext::SetVideoOutput(const VideoPicture* videoPicture)
+   {
+     m_eglContext.DestroySurface();
+ 
+-    std::vector<uint64_t> fallbackModifiers = {DRM_FORMAT_MOD_LINEAR};
+-    std::vector<uint64_t>* modifiers = &fallbackModifiers;
+-
+-    for (auto& fmt : m_DRM->GetOutputFormats())
+-    {
+-      if (fmt.drm == format && fmt.active)
+-      {
+-        modifiers = &fmt.modifiers;
+-        break;
+-      }
+-    }
++    std::vector<uint64_t> modifierList = OutputModifiers(format);
++    std::vector<uint64_t>* modifiers = &modifierList;
+ 
+     if (!m_GBM->GetDevice().CreateSurface(m_nWidth, m_nHeight, format, modifiers->data(),
+                                           modifiers->size()))
+diff --git a/xbmc/windowing/gbm/WinSystemGbmEGLContext.h b/xbmc/windowing/gbm/WinSystemGbmEGLContext.h
+index 1580be947e..2be95750cc 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmEGLContext.h
++++ b/xbmc/windowing/gbm/WinSystemGbmEGLContext.h
+@@ -43,6 +43,7 @@ public:
+   bool UnbindTextureUploadContext() override;
+   bool HasContext() override;
+ 
++  std::vector<uint64_t> OutputModifiers(uint32_t format);
+   bool SetVideoOutput(const VideoPicture* videoPicture) override;
+ 
+ protected:

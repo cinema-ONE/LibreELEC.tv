@@ -1,0 +1,463 @@
+From 43f36c9d58c6be4e86e020b3233592ffc9626d94 Mon Sep 17 00:00:00 2001
+From: Dom Cobley <popcornmix@gmail.com>
+Date: Sun, 30 Aug 2026 11:59:04 +0100
+Subject: [PATCH 21/22] Stereoscopics: settle the display mode for a 3D source
+ in one change
+
+Starting a stereoscopic title reconfigured the display three times in the six seconds
+before the film appeared, and on a projector each of those is a resynchronisation - the
+last of them, into a 3D mode, several seconds of it.
+
+The first came from the search that runs when the video stream opens. The stereo mode
+that decides what the display mode has to carry is applied when the first picture
+reaches the renderer, which on a 4K file is seconds later, so the search ran while the
+output was still 2D and picked the 2D mode of the right timing - a mode chosen for a
+frame nobody was going to see, since nothing of the film is on screen until the picture
+that settles the question arrives. Leave the display alone until then. Only where a
+stereo mode is certain to be applied without asking: with the playback mode set to ask
+the viewer's answer may be a while coming, and with it set to ignore no mode is coming
+at all, so in both the search goes ahead as before.
+
+The second and third were the stereo mode and the display mode arriving separately.
+Applying a stereo mode re-applies the display mode by itself - the surface changes shape
+with it - so the mode change that follows a moment later, when the player's search has
+run, reconfigures a display that was reconfigured for the same reason a frame earlier.
+Choose that mode when the stereo mode is applied and hand the two over together, which
+is what CGraphicContext::SetStereoMode() now takes. The player is still asked to run its
+search: that is what keeps the display latency and its own parameters in step, and by
+then the mode is already set, so it settles on the same one and changes nothing.
+
+ChooseBestResolution() therefore has to be able to choose for an arrangement that has
+not been applied yet, so it takes the one to choose for, defaulting to the arrangement
+the graphics context has been given. Writing the resolution before the mode keeps a flip
+from seeing one without the other.
+
+Which mode a stereoscopic source's search is waiting for is the manager's to say, so it
+says it - IsStereoModeSettled(), true once it has decided for a stereoscopic stream. The
+decision is announced as a stream change like any other, so where it changed nothing the
+search that was deferred still has to be asked for; that ask is made once, since
+servicing it is announced as a stream change in turn and asking again on that would not
+end.
+
+Finally, compare the mode in effect against the arrangement the display can carry rather
+than the one the source asks for. They differ whenever the display carries only the
+other arrangement, and a source left in its own - which is what happens when the
+geometry needed to choose is not known yet - would otherwise never be revisited.
+
+(cherry picked from commit 479504782bfcd93408aadf209c9fffdec1475503)
+---
+ xbmc/guilib/StereoscopicsManager.cpp | 82 ++++++++++++++++++++++++++--
+ xbmc/guilib/StereoscopicsManager.h   | 16 ++++++
+ xbmc/windowing/GraphicContext.cpp    | 10 +++-
+ xbmc/windowing/GraphicContext.h      | 17 +++++-
+ xbmc/windowing/Resolution.cpp        | 82 ++++++++++++++++++++++++----
+ xbmc/windowing/Resolution.h          | 20 ++++++-
+ 6 files changed, 207 insertions(+), 20 deletions(-)
+
+diff --git a/xbmc/guilib/StereoscopicsManager.cpp b/xbmc/guilib/StereoscopicsManager.cpp
+index 64ea10eae5..e7ffd2f3a7 100644
+--- a/xbmc/guilib/StereoscopicsManager.cpp
++++ b/xbmc/guilib/StereoscopicsManager.cpp
+@@ -114,6 +114,33 @@ RenderStereoMode ArrangementForDisplay(RenderStereoMode mode)
+   return CServiceBroker::GetRenderSystem()->SupportsStereo(arrangement) ? arrangement : mode;
+ }
+ 
++//! @brief The display mode the video being played calls for, now that the stereo mode
++//!        about to be applied is the one the graphics context has been given.
++//!
++//! Chosen here rather than left to the search the player runs a moment later, so that the
++//! mode can be applied along with the stereo mode itself: the two arriving separately is
++//! two display reconfigures where one would do. The player is still asked to run its own
++//! search, which by then settles on this same mode and changes nothing.
++RESOLUTION ResolutionForPlayingVideo(RenderStereoMode mode)
++{
++  const auto& components = CServiceBroker::GetAppComponents();
++  const auto appPlayer = components.GetComponent<CApplicationPlayer>();
++  if (!appPlayer || !appPlayer->IsPlaying())
++    return RES_INVALID;
++
++  VideoStreamInfo info;
++  appPlayer->GetVideoStreamInfo(CURRENT_STREAM, info);
++  if (!info.valid || info.fpsRate == 0 || info.fpsScale == 0)
++    return RES_INVALID;
++
++  const std::string stereoMode{CServiceBroker::GetDataCacheCore().GetVideoStereoMode()};
++  const bool is3D{!stereoMode.empty() && stereoMode != "mono"};
++
++  return CResolutionUtils::ChooseBestResolution(static_cast<float>(info.fpsRate) /
++                                                    static_cast<float>(info.fpsScale),
++                                                info.width, info.height, is3D, mode);
++}
++
+ } // namespace
+ 
+ static const struct StereoModeMap StringToGuiModeMap[] = {
+@@ -557,7 +584,16 @@ void CStereoscopicsManager::ApplyStereoMode(const RenderStereoMode mode, bool no
+             ConvertGuiStereoModeToString(currentMode), ConvertGuiStereoModeToString(mode));
+   if (currentMode != mode)
+   {
+-    CServiceBroker::GetWinSystem()->GetGfxContext().SetStereoMode(mode);
++    // Choose the display mode for the arrangement being applied and hand the two over
++    // together, so the display is reconfigured once rather than twice: applying a stereo
++    // mode re-applies the display mode by itself, and a mode change arriving a frame later
++    // re-applies it again. Only where playback would be allowed to change it, as below.
++    const bool adjustsRefreshRate{
++        m_settings->GetInt(CSettings::SETTING_VIDEOPLAYER_ADJUSTREFRESHRATE) !=
++        ADJUST_REFRESHRATE_OFF};
++
++    CServiceBroker::GetWinSystem()->GetGfxContext().SetStereoMode(
++        mode, adjustsRefreshRate ? ResolutionForPlayingVideo(mode) : RES_INVALID);
+     CLog::Log(LOGDEBUG, "StereoscopicsManager: stereo mode changed to {}",
+               ConvertGuiStereoModeToString(mode));
+     {
+@@ -570,8 +606,9 @@ void CStereoscopicsManager::ApplyStereoMode(const RenderStereoMode mode, bool no
+         // arrangement mid-playback too. Left in place for "Play as 2D" the sink
+         // keeps signalling 3D, and a half 3D mode's doubled fPixelRatio is no
+         // longer compensated for by GetResInfo() once the GUI leaves the split
+-        // mode, which squeezes the single eye into half the screen width. Let the
+-        // player re-run the search: it owns the stream parameters it needs.
++        // mode, which squeezes the single eye into half the screen width. The mode it
++        // settles on is the one just applied above, so this changes nothing further; it
++        // is what keeps the display latency and the player's own parameters in step.
+         appPlayer->TriggerUpdateResolution();
+       }
+       // With nothing playing there is no search to trigger, so run it here - but only
+@@ -617,6 +654,34 @@ bool CStereoscopicsManager::IsVideoStereoscopic() const
+ }
+ 
+ void CStereoscopicsManager::OnStreamChange()
++{
++  UpdateStereoModeForStream();
++
++  // The display mode a stereoscopic source needs follows from the stereo mode, so the
++  // search for it is left until that mode is known - which is now. Where the decision
++  // above changed the mode, applying it has already re-run the search; where it left the
++  // mode as it was, nothing else will, and the source would keep whatever mode the last
++  // one left behind.
++  auto& components = CServiceBroker::GetAppComponents();
++  const auto appPlayer = components.GetComponent<CApplicationPlayer>();
++  // Not settled until the source is known to be stereoscopic: a stream change that
++  // arrives before the player has said what it is playing has decided nothing, and
++  // taking it for a decision leaves the display mode to be chosen against a stereo mode
++  // that has not been applied yet.
++  if (m_stereoModeSettled || !appPlayer || !appPlayer->IsPlaying() || !IsVideoStereoscopic())
++    return;
++
++  m_stereoModeSettled = true;
++
++  // Where the decision above changed the stereo mode, applying it chose the display mode
++  // to go with it; where it left the mode alone, nothing has, and a stereoscopic source
++  // would keep whatever mode the title before it left behind. Ask for the search that was
++  // left until now - once, since servicing it is announced as another stream change and
++  // asking again on that would not end.
++  appPlayer->TriggerUpdateResolution();
++}
++
++void CStereoscopicsManager::UpdateStereoModeForStream()
+ {
+   STEREOSCOPIC_PLAYBACK_MODE playbackMode = static_cast<STEREOSCOPIC_PLAYBACK_MODE>(m_settings->GetInt(CSettings::SETTING_VIDEOPLAYER_STEREOSCOPICPLAYBACKMODE));
+   RenderStereoMode mode = GetStereoMode();
+@@ -654,8 +719,13 @@ void CStereoscopicsManager::OnStreamChange()
+     if (m_settings->GetBool(CSettings::SETTING_VIDEOPLAYER_QUITSTEREOMODEONSTOP) == false)
+       return;
+ 
+-    // only change to new stereo mode if not yet in preferred stereo mode
+-    if (mode == preferred || (preferred == RenderStereoMode::AUTO && mode == playing))
++    // only change to new stereo mode if not yet in preferred stereo mode, comparing
++    // against the arrangement the display can carry, since that is what would be applied.
++    // A mode that suits the source but not the display - side by side where the display
++    // offers only top and bottom, which is how a stream whose geometry was not yet known
++    // ends up - is not a mode to settle for, and nothing else would revisit it.
++    if (mode == ArrangementForDisplay(preferred) ||
++        (preferred == RenderStereoMode::AUTO && mode == ArrangementForDisplay(playing)))
+       return;
+   }
+ 
+@@ -727,6 +797,8 @@ void CStereoscopicsManager::OnPlaybackStopped(void)
+       mode != RenderStereoMode::OFF)
+     SetStereoMode(RenderStereoMode::OFF);
+ 
++  m_stereoModeSettled = false;
++
+   // reset user modes on playback end to start over new on next playback and not end up in a probably unwanted mode
+   if (m_stereoModeSetByUser != RenderStereoMode::OFF)
+     m_lastStereoModeSetByUser = m_stereoModeSetByUser;
+diff --git a/xbmc/guilib/StereoscopicsManager.h b/xbmc/guilib/StereoscopicsManager.h
+index f3e8e007e3..36c0d51346 100644
+--- a/xbmc/guilib/StereoscopicsManager.h
++++ b/xbmc/guilib/StereoscopicsManager.h
+@@ -61,6 +61,18 @@ public:
+ 
+   void OnSettingChanged(const std::shared_ptr<const CSetting>& setting) override;
+   void OnStreamChange();
++
++  /*!
++   * \brief Whether the stereo mode of the stream being played has been settled.
++   *
++   * A stereoscopic source's display mode follows from its stereo mode, so until this is
++   * true there is nothing to choose one against and the choice is left alone. Settled
++   * the moment the stream is announced, which is well before its first picture.
++   */
++  bool IsStereoModeSettled() const { return m_stereoModeSettled; }
++
++  //! \brief Choose and apply the stereo mode the stream that just started calls for.
++  void UpdateStereoModeForStream();
+   bool OnMessage(CGUIMessage &message) override;
+   /*!
+    * @brief Handle 3D specific cActions
+@@ -80,6 +92,10 @@ private:
+ 
+   void SetStereoModeByUser(const RenderStereoMode mode);
+ 
++  /*! Whether the stereo mode of the stream being played has been settled - see
++      IsStereoModeSettled(). */
++  bool m_stereoModeSettled{false};
++
+   void ApplyStereoMode(const RenderStereoMode mode, bool notify = true);
+   void OnPlaybackStopped(void);
+ 
+diff --git a/xbmc/windowing/GraphicContext.cpp b/xbmc/windowing/GraphicContext.cpp
+index 482b8a9667..8ada0a4f90 100644
+--- a/xbmc/windowing/GraphicContext.cpp
++++ b/xbmc/windowing/GraphicContext.cpp
+@@ -1011,7 +1011,15 @@ void CGraphicContext::Flip(bool rendered, bool videoLayer)
+   if(m_stereoMode != m_nextStereoMode)
+   {
+     m_stereoMode = m_nextStereoMode;
+-    SetVideoResolution(GetVideoResolution(), true);
++
++    // The surface changes shape with the stereo mode, so the display mode is re-applied
++    // whatever it is. Where a different one was asked for along with the stereo mode, this
++    // is where it lands, in that same reconfigure rather than a second one.
++    const RESOLUTION resolution{m_nextStereoResolution != RES_INVALID ? m_nextStereoResolution
++                                                                      : GetVideoResolution()};
++    m_nextStereoResolution = RES_INVALID;
++
++    SetVideoResolution(resolution, true);
+     CServiceBroker::GetGUI()->GetWindowManager().SendMessage(GUI_MSG_NOTIFY_ALL, 0, 0, GUI_MSG_RENDERER_RESET);
+   }
+ }
+diff --git a/xbmc/windowing/GraphicContext.h b/xbmc/windowing/GraphicContext.h
+index 51afcac577..e85affdbf3 100644
+--- a/xbmc/windowing/GraphicContext.h
++++ b/xbmc/windowing/GraphicContext.h
+@@ -156,7 +156,21 @@ public:
+   void SetCameraPosition(const CPoint &camera);
+   void SetStereoView(RenderStereoView view);
+   RenderStereoView GetStereoView() { return m_stereoView; }
+-  void SetStereoMode(RenderStereoMode mode) { m_nextStereoMode = mode; }
++  /*! \brief Set the stereo mode Flip() will make current.
++   * \param mode the stereo mode to apply
++   * \param resolution the display mode to apply along with it, or RES_INVALID to keep the
++   *        one in use. Applying a stereo mode re-applies the display mode by itself, the
++   *        surface changing shape with it, so a mode change that follows from the stereo
++   *        mode costs nothing extra when it comes in here; sent separately it costs a
++   *        second reconfigure, which on a display that resynchronises is seconds of blank
++   *        screen. Written before the mode itself, so that a flip either sees neither or
++   *        both.
++   */
++  void SetStereoMode(RenderStereoMode mode, RESOLUTION resolution = RES_INVALID)
++  {
++    m_nextStereoResolution = resolution;
++    m_nextStereoMode = mode;
++  }
+   RenderStereoMode GetStereoMode() { return m_stereoMode; }
+   /*! \brief The stereo mode SetStereoMode() has requested, which Flip() makes
+              current. Use this over GetStereoMode() to decide what the output
+@@ -274,6 +288,7 @@ protected:
+   RenderStereoView m_stereoView = RenderStereoView::OFF;
+   RenderStereoMode m_stereoMode = RenderStereoMode::OFF;
+   RenderStereoMode m_nextStereoMode = RenderStereoMode::OFF;
++  RESOLUTION m_nextStereoResolution = RES_INVALID;
+ 
+   bool m_isTransferPQ{false};
+   RENDER_ORDER m_renderOrder{RENDER_ORDER_ALL_BACK_TO_FRONT};
+diff --git a/xbmc/windowing/Resolution.cpp b/xbmc/windowing/Resolution.cpp
+index b4f5897fae..f7b313dd44 100644
+--- a/xbmc/windowing/Resolution.cpp
++++ b/xbmc/windowing/Resolution.cpp
+@@ -10,6 +10,8 @@
+ 
+ #include "GraphicContext.h"
+ #include "ServiceBroker.h"
++#include "guilib/GUIComponent.h"
++#include "guilib/StereoscopicsManager.h"
+ #include "settings/AdvancedSettings.h"
+ #include "settings/DisplaySettings.h"
+ #include "settings/Settings.h"
+@@ -165,6 +167,42 @@ std::vector<RESOLUTION> Find3DCandidates(const std::vector<CVariant>& indexList,
+   return candidates;
+ }
+ 
++//! @brief Whether a stereo mode is on its way but not here yet, leaving what the display
++//!        mode has to carry unknown.
++//!
++//! The stereo mode of a stereoscopic source is applied when its first picture reaches the
++//! renderer, which on a large file is seconds after the stream opens; until then the
++//! player's copy of the source's layout, which is what the manager acts on, is empty.
++//! Nothing of the film is on screen in that time, so a mode chosen for 2D output now shows
++//! the viewer nothing and costs them a display mode change, and another when the mode that
++//! was actually wanted arrives - on a display that resynchronises, seconds of blank screen
++//! each. Leave the mode alone and let the search that follows the stereo mode do the work.
++//!
++//! Only where that mode is certain to be applied without asking. With the playback mode set
++//! to ask, the viewer's answer may be a while coming and the film would play at the desktop
++//! refresh rate until it arrived; with it set to ignore, no mode is coming at all.
++bool StereoModePending(bool is3D, RenderStereoMode stereoMode)
++{
++  if (!is3D)
++    return false;
++
++  CGUIComponent* gui{CServiceBroker::GetGUI()};
++  if (!gui || gui->GetStereoscopicsManager().IsStereoModeSettled())
++    return false;
++
++  // A mode already in effect - the title before this one left the GUI in it, or the caller
++  // named the one it is applying - is the mode to search against, and the search can go
++  // ahead.
++  if (stereoMode != RenderStereoMode::OFF)
++    return false;
++
++  const int playbackMode{CServiceBroker::GetSettingsComponent()->GetSettings()->GetInt(
++      CSettings::SETTING_VIDEOPLAYER_STEREOSCOPICPLAYBACKMODE)};
++
++  return playbackMode == STEREOSCOPIC_PLAYBACK_MODE_PREFERRED ||
++         playbackMode == STEREOSCOPIC_PLAYBACK_MODE_MONO;
++}
++
+ //! @brief Whether the output puts a single image on the whole screen, so that a hardware
+ //!        3D mode is the wrong shape for it.
+ //!
+@@ -172,15 +210,22 @@ std::vector<RESOLUTION> Find3DCandidates(const std::vector<CVariant>& indexList,
+ //! deferred to the next flip, so a search triggered by the change itself - which is
+ //! exactly when the display mode has to be re-chosen - would otherwise still see the
+ //! mode being left behind.
+-bool Wants2DOutput(bool is3D)
++bool Wants2DOutput(bool is3D, RenderStereoMode stereoMode)
+ {
+-  const RenderStereoMode stereoMode =
+-      CServiceBroker::GetWinSystem()->GetGfxContext().GetNextStereoMode();
+-
+   return !is3D || (stereoMode != RenderStereoMode::SPLIT_VERTICAL &&
+                    stereoMode != RenderStereoMode::SPLIT_HORIZONTAL);
+ }
+ 
++//! @brief The stereo output arrangement to choose a display mode for: the one the caller
++//!        is about to apply, or the one the graphics context already has.
++RenderStereoMode OutputMode(RenderStereoMode requested)
++{
++  if (requested != RenderStereoMode::UNDEFINED)
++    return requested;
++
++  return CServiceBroker::GetWinSystem()->GetGfxContext().GetNextStereoMode();
++}
++
+ //! @brief The refresh rates to try for a native 3D mode, best first: the content rate,
+ //!        then double it, then a 3:2 pulldown rate, then the rate the GUI is running at.
+ //!
+@@ -336,11 +381,21 @@ std::string RESOLUTION_INFO::StereoLayoutTag() const
+   return "";
+ }
+ 
+-RESOLUTION CResolutionUtils::ChooseBestResolution(float fps, int width, int height, bool is3D)
++RESOLUTION CResolutionUtils::ChooseBestResolution(
++    float fps, int width, int height, bool is3D, RenderStereoMode outputMode)
+ {
++  const RenderStereoMode stereoMode{OutputMode(outputMode)};
++
+   RESOLUTION res = CServiceBroker::GetWinSystem()->GetGfxContext().GetVideoResolution();
+   float weight = 0.0f;
+ 
++  if (StereoModePending(is3D, stereoMode))
++  {
++    CLog::Log(LOGDEBUG, "[WHITELIST] Stereoscopic source, leaving the display mode until the "
++                        "stereo mode it needs has been applied");
++    return res;
++  }
++
+   // A stereoscopic source packs both eyes into one frame, but a display mode has
+   // to fit one eye.
+   if (is3D)
+@@ -355,7 +410,8 @@ RESOLUTION CResolutionUtils::ChooseBestResolution(float fps, int width, int heig
+   {
+     if (!FindResolutionFromOverride(fps, width, is3D, res, weight, true)) //if that fails find it from a fallback
+     {
+-      FindResolutionFromWhitelist(fps, width, height, is3D, res); //find a refreshrate from whitelist
++      FindResolutionFromWhitelist(fps, width, height, is3D, res,
++                                  stereoMode); //find a refreshrate from whitelist
+     }
+   }
+ 
+@@ -365,7 +421,7 @@ RESOLUTION CResolutionUtils::ChooseBestResolution(float fps, int width, int heig
+   // rather than keep it, fall back to the desktop mode - the one mode known to be meant
+   // for a single image, and what playing the same content from a cold start would have
+   // left in place.
+-  if (Wants2DOutput(is3D) &&
++  if (Wants2DOutput(is3D, stereoMode) &&
+       (CDisplaySettings::GetInstance().GetResolutionInfo(res).dwFlags & STEREO_FLAGS))
+   {
+     const RESOLUTION desktop = CDisplaySettings::GetInstance().GetCurrentResolution();
+@@ -428,7 +484,12 @@ RenderStereoMode CResolutionUtils::ChooseStereoArrangement(RenderStereoMode want
+   return wanted;
+ }
+ 
+-void CResolutionUtils::FindResolutionFromWhitelist(float fps, int width, int height, bool is3D, RESOLUTION &resolution)
++void CResolutionUtils::FindResolutionFromWhitelist(float fps,
++                                                   int width,
++                                                   int height,
++                                                   bool is3D,
++                                                   RESOLUTION& resolution,
++                                                   RenderStereoMode outputMode)
+ {
+   RESOLUTION_INFO curr = CServiceBroker::GetWinSystem()->GetGfxContext().GetResInfo(resolution);
+   CLog::Log(LOGINFO,
+@@ -448,9 +509,8 @@ void CResolutionUtils::FindResolutionFromWhitelist(float fps, int width, int hei
+   // once the GUI leaves the split mode, squeezing that eye to half the width.
+   //
+   // The requested mode, not the current one - see Wants2DOutput().
+-  const RenderStereoMode stereoMode =
+-      CServiceBroker::GetWinSystem()->GetGfxContext().GetNextStereoMode();
+-  const bool wants2D = Wants2DOutput(is3D);
++  const RenderStereoMode stereoMode{outputMode};
++  const bool wants2D = Wants2DOutput(is3D, stereoMode);
+ 
+   // Flags a candidate has to share with the mode it is compared against below. For
+   // 2D output the 3D layout bits are dropped from both sides: GetResInfo() OR-s the
+diff --git a/xbmc/windowing/Resolution.h b/xbmc/windowing/Resolution.h
+index d6dafd1f8f..b0ac4db0dc 100644
+--- a/xbmc/windowing/Resolution.h
++++ b/xbmc/windowing/Resolution.h
+@@ -134,7 +134,18 @@ public:
+ class CResolutionUtils
+ {
+ public:
+-  static RESOLUTION ChooseBestResolution(float fps, int width, int height, bool is3D);
++  /*!
++   * \brief Choose the display mode to play a stream in.
++   * \param outputMode the stereo output arrangement to choose for, where the caller is
++   *        about to apply one; UNDEFINED to use the one the graphics context has been
++   *        given. Naming it lets the mode be chosen before that one is applied, so the
++   *        two can be applied together.
++   */
++  static RESOLUTION ChooseBestResolution(float fps,
++                                         int width,
++                                         int height,
++                                         bool is3D,
++                                         RenderStereoMode outputMode = RenderStereoMode::UNDEFINED);
+ 
+   /*!
+    * \brief The stereoscopic output arrangement the display can present
+@@ -162,7 +173,12 @@ public:
+   static void GetMaxAllowedScreenResolution(unsigned int& width, unsigned int& height);
+ 
+ protected:
+-  static void FindResolutionFromWhitelist(float fps, int width, int height, bool is3D, RESOLUTION &resolution);
++  static void FindResolutionFromWhitelist(float fps,
++                                          int width,
++                                          int height,
++                                          bool is3D,
++                                          RESOLUTION& resolution,
++                                          RenderStereoMode outputMode);
+   static bool FindResolutionFromOverride(float fps, int width, bool is3D, RESOLUTION &resolution, float& weight, bool fallback);
+   static float RefreshWeight(float refresh, float fps);
+ };

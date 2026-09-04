@@ -1,0 +1,185 @@
+From 5d1588fe36d526c2b821026fc0dddcadcaf760fa Mon Sep 17 00:00:00 2001
+From: Dom Cobley <popcornmix@gmail.com>
+Date: Sun, 26 Jul 2026 17:15:18 +0100
+Subject: [PATCH 12/22] RendererDRMPRIMEGLES: honour the source rectangle when
+ sampling
+
+Both draw paths hardcoded texture coordinates 0..1, so a side-by-side or
+top-and-bottom source was tiled whole into each eye instead of showing the eye
+CBaseRenderer::ManageRenderArea() had cropped m_sourceRect to.
+
+Derive the texture coordinates from m_sourceRect instead. There is no
+stereoscopic branch: for 2D content m_sourceRect is the whole frame, so the
+normalised rect is exactly 0..1 and the output is unchanged. Per-plane
+texcoords are normalised - each EGL-imported texture covers its whole plane
+regardless of chroma subsampling - so the same fractional crop applies to all
+three planes of the limited-range path as well as to the OES path.
+
+DrawTexture() is shared with direct-to-plane screencap and is static, so it
+takes the crop as a parameter rather than reading m_sourceRect: Render() passes
+the cropped rect, and the screencap keeps the whole frame it drew before, so a
+stereoscopic source is captured packed as the plane scans it out rather than
+cropped to whichever eye happens to be drawing.
+
+(cherry picked from commit 0367c0700eef79aa9e6fc01734a4259a7f96e66e)
+---
+ .../HwDecRender/DRMPRIMECaptureGLES.cpp       |  5 +-
+ .../HwDecRender/RendererDRMPRIMEGLES.cpp      | 49 +++++++++++--------
+ .../HwDecRender/RendererDRMPRIMEGLES.h        | 16 ++++--
+ 3 files changed, 45 insertions(+), 25 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DRMPRIMECaptureGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DRMPRIMECaptureGLES.cpp
+index 7c62cdca68..0a4929761f 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DRMPRIMECaptureGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DRMPRIMECaptureGLES.cpp
+@@ -110,7 +110,10 @@ bool CaptureDRMPRIMEVideo(CVideoBufferDRMPRIME* buffer,
+                             {static_cast<float>(width), 0.0f},
+                             {static_cast<float>(width), static_cast<float>(height)},
+                             {0.0f, static_cast<float>(height)}};
+-    CRendererDRMPRIMEGLES::DrawTexture(*renderSystem, texture.GetTexture(), dest);
++    // whole buffer: a stereoscopic source is captured packed, as the plane
++    // scans it out, rather than cropped to whichever eye is drawing now
++    CRendererDRMPRIMEGLES::DrawTexture(*renderSystem, texture.GetTexture(), dest,
++                                       CRect(0.0f, 0.0f, 1.0f, 1.0f));
+ 
+     glMatrixProject.PopLoad();
+     glMatrixModview.PopLoad();
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIMEGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIMEGLES.cpp
+index e1ccc815f8..3f17f5f7c3 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIMEGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIMEGLES.cpp
+@@ -446,6 +446,12 @@ bool CRendererDRMPRIMEGLES::ConfigChanged(const VideoPicture& picture)
+   return false;
+ }
+ 
++CRect CRendererDRMPRIMEGLES::GetNormalisedSourceRect() const
++{
++  return CRect(m_sourceRect.x1 / m_sourceWidth, m_sourceRect.y1 / m_sourceHeight,
++               m_sourceRect.x2 / m_sourceWidth, m_sourceRect.y2 / m_sourceHeight);
++}
++
+ void CRendererDRMPRIMEGLES::Render(unsigned int flags, int index)
+ {
+   BUFFER& buf = m_buffers[index];
+@@ -523,18 +529,19 @@ void CRendererDRMPRIMEGLES::Render(unsigned int flags, int index)
+       vert[i][2] = 0.0f;
+     }
+ 
+-    // Per-plane texcoords are 0..1; each EGL-imported texture covers the
+-    // whole plane regardless of chroma subsampling.
++    // Per-plane texcoords are normalised; each EGL-imported texture covers the
++    // whole plane regardless of chroma subsampling, so one crop fits all three.
++    const CRect crop = GetNormalisedSourceRect();
+     for (int p = 0; p < 3; p++)
+     {
+-      tex[p][0][0] = 0.0f;
+-      tex[p][0][1] = 0.0f;
+-      tex[p][1][0] = 1.0f;
+-      tex[p][1][1] = 0.0f;
+-      tex[p][2][0] = 1.0f;
+-      tex[p][2][1] = 1.0f;
+-      tex[p][3][0] = 0.0f;
+-      tex[p][3][1] = 1.0f;
++      tex[p][0][0] = crop.x1;
++      tex[p][0][1] = crop.y1;
++      tex[p][1][0] = crop.x2;
++      tex[p][1][1] = crop.y1;
++      tex[p][2][0] = crop.x2;
++      tex[p][2][1] = crop.y2;
++      tex[p][3][0] = crop.x1;
++      tex[p][3][1] = crop.y2;
+     }
+ 
+     glDrawElements(GL_TRIANGLE_STRIP, 4, GL_UNSIGNED_BYTE, idx);
+@@ -563,7 +570,8 @@ void CRendererDRMPRIMEGLES::Render(unsigned int flags, int index)
+   if (!texture)
+     return;
+ 
+-  DrawTexture(*renderSystem, texture->GetTexture(), m_rotatedDestCoords);
++  DrawTexture(*renderSystem, texture->GetTexture(), m_rotatedDestCoords,
++              GetNormalisedSourceRect());
+ 
+   buf.fence->DestroyFence();
+   buf.fence->CreateFence();
+@@ -571,7 +579,8 @@ void CRendererDRMPRIMEGLES::Render(unsigned int flags, int index)
+ 
+ void CRendererDRMPRIMEGLES::DrawTexture(CRenderSystemGLES& renderSystem,
+                                         GLuint texture,
+-                                        const CPoint dest[4])
++                                        const CPoint dest[4],
++                                        const CRect& crop)
+ {
+   glBindTexture(GL_TEXTURE_EXTERNAL_OES, texture);
+ 
+@@ -596,29 +605,29 @@ void CRendererDRMPRIMEGLES::DrawTexture(CRenderSystemGLES& renderSystem,
+   vertex[0].x = dest[0].x;
+   vertex[0].y = dest[0].y;
+   vertex[0].z = 0.0f;
+-  vertex[0].u1 = 0.0f;
+-  vertex[0].v1 = 0.0f;
++  vertex[0].u1 = crop.x1;
++  vertex[0].v1 = crop.y1;
+ 
+   // top right
+   vertex[1].x = dest[1].x;
+   vertex[1].y = dest[1].y;
+   vertex[1].z = 0.0f;
+-  vertex[1].u1 = 1.0f;
+-  vertex[1].v1 = 0.0f;
++  vertex[1].u1 = crop.x2;
++  vertex[1].v1 = crop.y1;
+ 
+   // bottom right
+   vertex[2].x = dest[2].x;
+   vertex[2].y = dest[2].y;
+   vertex[2].z = 0.0f;
+-  vertex[2].u1 = 1.0f;
+-  vertex[2].v1 = 1.0f;
++  vertex[2].u1 = crop.x2;
++  vertex[2].v1 = crop.y2;
+ 
+   // bottom left
+   vertex[3].x = dest[3].x;
+   vertex[3].y = dest[3].y;
+   vertex[3].z = 0.0f;
+-  vertex[3].u1 = 0.0f;
+-  vertex[3].v1 = 1.0f;
++  vertex[3].u1 = crop.x1;
++  vertex[3].v1 = crop.y2;
+ 
+   glGenBuffers(1, &vertexVBO);
+   glBindBuffer(GL_ARRAY_BUFFER, vertexVBO);
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIMEGLES.h b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIMEGLES.h
+index 8bd8688688..49d3dd4177 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIMEGLES.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIMEGLES.h
+@@ -44,10 +44,14 @@ public:
+   static CBaseRenderer* Create(CVideoBuffer* buffer);
+   static void Register();
+ 
+-  //! Draw an imported DRMPRIME OES texture as a quad at dest (4 points,
+-  //! full-frame texcoords) with SM_TEXTURE_RGBA_OES; sets no contrast or
+-  //! brightness. Shared by Render() and direct-to-plane screencap.
+-  static void DrawTexture(CRenderSystemGLES& renderSystem, GLuint texture, const CPoint dest[4]);
++  //! Draw an imported DRMPRIME OES texture as a quad at dest (4 points),
++  //! sampling the normalised crop (0..1 for the whole frame), with
++  //! SM_TEXTURE_RGBA_OES; sets no contrast or brightness. Shared by Render()
++  //! and direct-to-plane screencap.
++  static void DrawTexture(CRenderSystemGLES& renderSystem,
++                          GLuint texture,
++                          const CPoint dest[4],
++                          const CRect& crop);
+ 
+   // Player functions
+   bool Configure(const VideoPicture& picture, float fps, unsigned int orientation) override;
+@@ -74,6 +78,10 @@ private:
+   void DrawBlackBars();
+   void Render(unsigned int flags, int index);
+ 
++  //! \brief m_sourceRect as texture coordinates (0..1); the whole frame unless
++  //!        ManageRenderArea() has cropped it to one eye of a stereo source.
++  CRect GetNormalisedSourceRect() const;
++
+   bool m_configured = false;
+   bool m_passthroughHDR{false};
+   bool m_hdrFboActive{false};

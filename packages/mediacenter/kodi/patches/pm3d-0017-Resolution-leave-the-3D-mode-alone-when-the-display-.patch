@@ -1,0 +1,226 @@
+From ca6fd176bfaf5868c8e3efe26f6f97686a50e95b Mon Sep 17 00:00:00 2001
+From: Dom Cobley <popcornmix@gmail.com>
+Date: Fri, 14 Aug 2026 17:21:47 +0100
+Subject: [PATCH 17/22] Resolution: leave the 3D mode alone when the display
+ mode is the viewer's
+
+Choosing the arrangement for the display assumed the display mode would follow. It
+does not follow when refresh rate adjusting is off: the mode is then whatever was
+picked by hand in videoscreen.resolution, and nothing re-chooses it. Remapping the
+arrangement there is worse than not remapping it - a hand-picked side-by-side mode
+kept receiving a top-and-bottom frame, because the arrangement moved to suit a
+frame-packing mode that was never going to be switched to. Kodi not being allowed
+to change the mode has to mean not overriding how the frame is split either. Which
+is also what makes a half mode testable: turn refresh rate adjusting off, pick the
+sbs or tab mode in videoscreen.resolution, and both stay put.
+
+ApplyStereoMode() ignored the same setting when nothing was playing, choosing a
+resolution outright rather than through the search the player runs, and so
+overwrote a hand-picked mode the moment 3D was toggled - before playback, which is
+exactly when a viewer sets one up. Gate it the same way.
+
+Neither of those helps while refresh rate adjusting is on, and there the half modes
+cannot be reached at all: frame packing wins on size wherever it exists, which on
+these EDIDs is every timing that has a half mode. So add
+stereoscopicpreferframepacking to advancedsettings.xml, turning that preference
+around, for exercising the half-resolution paths without giving up mode switching.
+It applies to both the choice within a layout and the choice between the two
+arrangements, or asking for the half modes would still land on frame packing
+whenever the other arrangement only offers that.
+
+The mode comparison behind those choices becomes one predicate rather than two
+copies of the rule, since it now has a second reading of "better" to express.
+
+Also correct where a 3D mode is selected by hand: the modes list dropped from the
+whitelist in the previous commit feeds videoscreen.resolution, whose labels carry
+the layout. videoscreen.screenmode only lists the rates within the resolution and
+layout already chosen.
+
+(cherry picked from commit e158ddee97fab3a31c6d7eebcf63945a5ad88eed)
+---
+ xbmc/guilib/StereoscopicsManager.cpp | 17 +++++++--
+ xbmc/settings/AdvancedSettings.cpp   |  3 ++
+ xbmc/settings/AdvancedSettings.h     |  5 +++
+ xbmc/settings/DisplaySettings.cpp    |  4 +--
+ xbmc/windowing/Resolution.cpp        | 53 ++++++++++++++++++++++------
+ 5 files changed, 67 insertions(+), 15 deletions(-)
+
+diff --git a/xbmc/guilib/StereoscopicsManager.cpp b/xbmc/guilib/StereoscopicsManager.cpp
+index 4f641855db..64ea10eae5 100644
+--- a/xbmc/guilib/StereoscopicsManager.cpp
++++ b/xbmc/guilib/StereoscopicsManager.cpp
+@@ -80,12 +80,20 @@ namespace
+ //! source on a display whose only 3D mode at this timing is frame packed has to go out
+ //! top-and-bottom, or the resolution search finds no 3D mode and the display stays 2D.
+ //! The stream parameters the display modes are matched against come from the player,
+-//! so with nothing playing the arrangement is left as asked for.
++//! so with nothing playing the arrangement is left as asked for. So it is with refresh
++//! rate adjusting turned off: Kodi may not change the display mode then, the mode is
++//! whatever was picked by hand in videoscreen.resolution, and overriding the
++//! arrangement would only split the frame the way a mode nobody is going to switch to
++//! wants it.
+ RenderStereoMode ArrangementForDisplay(RenderStereoMode mode)
+ {
+   if (mode != RenderStereoMode::SPLIT_VERTICAL && mode != RenderStereoMode::SPLIT_HORIZONTAL)
+     return mode;
+ 
++  if (CServiceBroker::GetSettingsComponent()->GetSettings()->GetInt(
++          CSettings::SETTING_VIDEOPLAYER_ADJUSTREFRESHRATE) == ADJUST_REFRESHRATE_OFF)
++    return mode;
++
+   const auto& components = CServiceBroker::GetAppComponents();
+   const auto appPlayer = components.GetComponent<CApplicationPlayer>();
+   if (!appPlayer || !appPlayer->IsPlaying())
+@@ -566,7 +574,12 @@ void CStereoscopicsManager::ApplyStereoMode(const RenderStereoMode mode, bool no
+         // player re-run the search: it owns the stream parameters it needs.
+         appPlayer->TriggerUpdateResolution();
+       }
+-      else if (appPlayer)
++      // With nothing playing there is no search to trigger, so run it here - but only
++      // where playback would be allowed to: with refresh rate adjusting off the display
++      // mode is the one picked by hand in videoscreen.resolution, and choosing another
++      // would discard that.
++      else if (appPlayer && m_settings->GetInt(CSettings::SETTING_VIDEOPLAYER_ADJUSTREFRESHRATE) !=
++                                ADJUST_REFRESHRATE_OFF)
+       {
+         const RESOLUTION_INFO curInfo =
+             CServiceBroker::GetWinSystem()->GetGfxContext().GetResInfo();
+diff --git a/xbmc/settings/AdvancedSettings.cpp b/xbmc/settings/AdvancedSettings.cpp
+index 78a4a55535..9d7bf66fc8 100644
+--- a/xbmc/settings/AdvancedSettings.cpp
++++ b/xbmc/settings/AdvancedSettings.cpp
+@@ -533,6 +533,7 @@ void CAdvancedSettings::Initialize()
+   m_stereoscopicregex_3d = "[-. _]3d[-. _]";
+   m_stereoscopicregex_sbs = "[-. _]h?sbs[-. _]";
+   m_stereoscopicregex_tab = "[-. _]h?tab[-. _]";
++  m_stereoscopicPreferFramePacking = true;
+ 
+   m_logLevelHint = m_logLevel = LOG_LEVEL_NORMAL;
+ 
+@@ -684,6 +685,8 @@ void CAdvancedSettings::ParseSettingsFile(const std::string &file)
+     XMLUtils::GetString(pElement, "stereoscopicregex3d", m_stereoscopicregex_3d);
+     XMLUtils::GetString(pElement, "stereoscopicregexsbs", m_stereoscopicregex_sbs);
+     XMLUtils::GetString(pElement, "stereoscopicregextab", m_stereoscopicregex_tab);
++    XMLUtils::GetBoolean(pElement, "stereoscopicpreferframepacking",
++                         m_stereoscopicPreferFramePacking);
+     XMLUtils::GetFloat(pElement, "subsdelayrange", m_videoSubsDelayRange, 10, 600);
+     XMLUtils::GetFloat(pElement, "subsdelaystep", m_videoSubsDelayStep, 0, 1.0f);
+     XMLUtils::GetFloat(pElement, "audiodelayrange", m_videoAudioDelayRange, 10, 600);
+diff --git a/xbmc/settings/AdvancedSettings.h b/xbmc/settings/AdvancedSettings.h
+index 4ee8f5cda9..9e3cf0677d 100644
+--- a/xbmc/settings/AdvancedSettings.h
++++ b/xbmc/settings/AdvancedSettings.h
+@@ -416,6 +416,11 @@ class CAdvancedSettings : public ISettingCallback, public ISettingsHandler
+     std::string m_stereoscopicregex_sbs;
+     std::string m_stereoscopicregex_tab;
+ 
++    //! Prefer a frame-packing display mode over a half-resolution 3D mode of the same
++    //! timing. Turn off to exercise the half modes, which are otherwise unreachable on
++    //! a display offering frame packing at every timing that has one.
++    bool m_stereoscopicPreferFramePacking;
++
+     bool m_openGlDebugging;
+ 
+     std::string m_userAgent;
+diff --git a/xbmc/settings/DisplaySettings.cpp b/xbmc/settings/DisplaySettings.cpp
+index 854b7c561b..f9e19e8a9a 100644
+--- a/xbmc/settings/DisplaySettings.cpp
++++ b/xbmc/settings/DisplaySettings.cpp
+@@ -765,8 +765,8 @@ void CDisplaySettings::SettingOptionsModesFiller(const std::shared_ptr<const CSe
+   // 3D variant is the same timing transported differently, which stereoscopic
+   // playback derives from that timing being whitelisted, so offering it here would be
+   // a choice with no meaning - and one whose packed geometry (1920x2205) reads as a
+-  // resolution the display does not have. Manual selection through
+-  // videoscreen.screenmode still lists them.
++  // resolution the display does not have. videoscreen.resolution still lists the
++  // layouts, which is where a 3D mode is selected by hand.
+   const bool omitStereoModes =
+       IsSettingOrItsListDefinition(setting, CSettings::SETTING_VIDEOSCREEN_WHITELIST);
+ 
+diff --git a/xbmc/windowing/Resolution.cpp b/xbmc/windowing/Resolution.cpp
+index 45d0983da6..ee907e96c4 100644
+--- a/xbmc/windowing/Resolution.cpp
++++ b/xbmc/windowing/Resolution.cpp
+@@ -189,17 +189,50 @@ const char* StereoTierName(size_t tier)
+ struct StereoMatch
+ {
+   RESOLUTION resolution{RES_INVALID};
+-  size_t tier{std::numeric_limits<size_t>::max()};
++  size_t tier{0};
+   int area{0};
+ };
+ 
++//! @brief Whether frame packing is what a 3D mode should be picked for. Off exercises
++//!        the half modes, which are otherwise unreachable on a display offering frame
++//!        packing at every timing that has one.
++bool PreferFramePacking()
++{
++  return CServiceBroker::GetSettingsComponent()
++      ->GetAdvancedSettings()
++      ->m_stereoscopicPreferFramePacking;
++}
++
++//! @brief True when @p a is the better of two modes: matching at an earlier refresh
++//!        tier, or at the same tier being the size preferred - frame packing carrying a
++//!        whole frame per eye, or a half mode if that is what is being exercised. Never
++//!        true of a layout the display has no mode for, and never for a tie, so the
++//!        arrangement already wanted keeps it.
++bool BetterMatch(const StereoMatch& a, const StereoMatch& b)
++{
++  if (a.resolution == RES_INVALID)
++    return false;
++
++  if (b.resolution == RES_INVALID)
++    return true;
++
++  if (a.tier != b.tier)
++    return a.tier < b.tier;
++
++  return PreferFramePacking() ? a.area > b.area : a.area < b.area;
++}
++
+ //! @brief The best candidate natively flagged @p stereoFlag: the earliest @p tiers
+ //!        entry any of them matches, and the largest at that tier, so frame packing
+-//!        (1920x2205) wins over a half-resolution 3D mode.
++//!        (1920x2205) wins over a half-resolution 3D mode - unless the
++//!        stereoscopicpreferframepacking advanced setting turns that around, which is
++//!        the only way to reach a half mode on a display offering frame packing at
++//!        every timing that has one.
+ StereoMatch FindNative3DMode(const std::vector<RESOLUTION>& candidates,
+                              uint32_t stereoFlag,
+                              const std::vector<float>& tiers)
+ {
++  const bool preferFramePacking = PreferFramePacking();
+   StereoMatch match;
+ 
+   for (size_t tier = 0; tier < tiers.size(); tier++)
+@@ -214,7 +247,8 @@ StereoMatch FindNative3DMode(const std::vector<RESOLUTION>& candidates,
+         continue;
+ 
+       const int area = info.iScreenWidth * info.iScreenHeight;
+-      if (area > match.area)
++      if (match.resolution == RES_INVALID ||
++          (preferFramePacking ? area > match.area : area < match.area))
+       {
+         match.resolution = i;
+         match.tier = tier;
+@@ -310,14 +344,11 @@ RenderStereoMode CResolutionUtils::ChooseStereoArrangement(RenderStereoMode want
+   const StereoMatch wantedMatch = FindNative3DMode(candidates, StereoFlagFor(wanted), tiers);
+   const StereoMatch otherMatch = FindNative3DMode(candidates, StereoFlagFor(other), tiers);
+ 
+-  // Only change the arrangement for a better mode: one matching at an earlier refresh
+-  // tier, or a larger one at the same tier - frame packing carries a whole frame per
+-  // eye where a half mode carries half of one. Neither arrangement matching leaves the
+-  // choice alone, which keeps a display with no native 3D mode for this content
+-  // behaving as it does today: it is one the viewer switches into 3D by hand, and
+-  // which half of the frame each eye lives in is then theirs to decide.
+-  if (otherMatch.tier < wantedMatch.tier ||
+-      (otherMatch.tier == wantedMatch.tier && otherMatch.area > wantedMatch.area))
++  // Only change the arrangement for a better mode. Neither arrangement having one
++  // leaves the choice alone, which keeps a display with no native 3D mode for this
++  // content behaving as it does today: it is one the viewer switches into 3D by hand,
++  // and which half of the frame each eye lives in is then theirs to decide.
++  if (BetterMatch(otherMatch, wantedMatch))
+   {
+     CLog::Log(LOGDEBUG,
+               "Stereoscopic 3D: changing the output arrangement to suit display mode {} at {}",

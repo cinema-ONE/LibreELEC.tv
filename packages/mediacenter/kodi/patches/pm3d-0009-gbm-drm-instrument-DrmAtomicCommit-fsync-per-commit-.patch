@@ -1,0 +1,61 @@
+From 8d0ed1cf2e26021d877d5b2ed716f9287093837e Mon Sep 17 00:00:00 2001
+From: cinemaONE <35371193+cinema-ONE@users.noreply.github.com>
+Date: Fri, 4 Sep 2026 18:11:10 +0200
+Subject: [PATCH 09/22] gbm/drm: instrument DrmAtomicCommit (fsync per commit
+ to /storage/kodi-atomic.log)
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ xbmc/windowing/gbm/drm/DRMAtomic.cpp | 32 +++++++++++++++++++++++++++-
+ 1 file changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/xbmc/windowing/gbm/drm/DRMAtomic.cpp b/xbmc/windowing/gbm/drm/DRMAtomic.cpp
+index 55a7a0e1ea..f58131efde 100644
+--- a/xbmc/windowing/gbm/drm/DRMAtomic.cpp
++++ b/xbmc/windowing/gbm/drm/DRMAtomic.cpp
+@@ -17,6 +17,7 @@
+ #include "utils/log.h"
+ 
+ #include <chrono>
++#include <cstdio>
+ #include <errno.h>
+ #include <string.h>
+ #include <thread>
+@@ -156,7 +157,36 @@ void CDRMAtomic::DrmAtomicCommit(int fb_id, int flags, bool rendered, bool video
+       AddProperty(outputPlane, "FB_ID", fb_id);
+   }
+ 
+-  ret = drmModeAtomicCommit(m_fd, m_req->Get(), flags, nullptr);
++  {
++    static FILE* g_atomlog = fopen("/storage/kodi-atomic.log", "w");
++    static int g_seq = 0;
++    if (g_atomlog)
++    {
++      auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
++                     std::chrono::steady_clock::now().time_since_epoch())
++                     .count();
++      fprintf(g_atomlog, "[%lld] #%d BEFORE flags=0x%x%s%s rendered=%d video=%d fb=%d",
++              static_cast<long long>(now), g_seq, flags,
++              (flags & DRM_MODE_ATOMIC_ALLOW_MODESET) ? " MODESET" : "",
++              (flags & DRM_MODE_ATOMIC_NONBLOCK) ? " NONBLOCK" : "", static_cast<int>(rendered),
++              static_cast<int>(videoLayer), fb_id);
++      if (m_mode)
++        fprintf(g_atomlog, " mode=%s flags3d=0x%x vdisp=%d", m_mode->name,
++                m_mode->flags & DRM_MODE_FLAG_3D_MASK, m_mode->vdisplay);
++      fprintf(g_atomlog, " crtc=%u gui=%u video=%u\n", m_crtc ? m_crtc->GetId() : 0,
++              m_gui_plane ? m_gui_plane->GetId() : 0, m_video_plane ? m_video_plane->GetId() : 0);
++      fflush(g_atomlog);
++      fsync(fileno(g_atomlog));
++    }
++    ret = drmModeAtomicCommit(m_fd, m_req->Get(), flags, nullptr);
++    if (g_atomlog)
++    {
++      fprintf(g_atomlog, "  #%d AFTER ret=%d %s\n", g_seq, ret, ret < 0 ? strerror(errno) : "");
++      fflush(g_atomlog);
++      fsync(fileno(g_atomlog));
++    }
++    g_seq++;
++  }
+   if (ret < 0)
+   {
+     CLog::LogF(LOGERROR, "atomic commit failed: {}", strerror(errno));

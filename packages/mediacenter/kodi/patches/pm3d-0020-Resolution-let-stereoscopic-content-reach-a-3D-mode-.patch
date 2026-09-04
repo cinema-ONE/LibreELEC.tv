@@ -1,0 +1,99 @@
+From 903011915da0843b11d6afcbde2ea4be58e526b7 Mon Sep 17 00:00:00 2001
+From: Dom Cobley <popcornmix@gmail.com>
+Date: Sat, 29 Aug 2026 19:43:01 +0100
+Subject: [PATCH 20/22] Resolution: let stereoscopic content reach a 3D mode
+ smaller than one eye
+
+The default whitelist's "don't downgrade below the current mode" floor is measured
+against the size of one eye, so that a 4K desktop does not exclude every 1080 and 720
+line HDMI 3D mode before the search has begun. That still leaves out content whose eye
+is larger than any 3D mode there is: HDMI defines no 3D timing above 1080 lines, so a
+4K stereoscopic file - a 3840x2160 side by side clip, or the 7680x2160 one whose eye is
+3840x2160 - matches nothing, falls through to a 2D mode, and goes out as two half width
+images on a display that was never told to expect them. The viewer switches the display
+into 3D by hand, which is the state this whole search exists to avoid.
+
+Not downgrading is a sharpness heuristic, and it has nothing to say when the
+alternative is showing 3D content flat. The eye is scaled to a display mode either way:
+by the sink, once it has been told what it is receiving, or by the renderer, before it
+has not.
+
+So keep the modes the floor turns down and fall back on them when it leaves nothing,
+rather than dropping them. Every case that finds a mode today is unaffected, the
+fallback list being consulted only when the floor's own list comes out empty, and
+within it FindNative3DMode() ranks as before - refresh tier first, then size - so frame
+packing still wins wherever the display offers it. Scan type and the half refresh rates
+the default whitelist leaves out stay hard filters: they are no more playable in 3D than
+in 2D, and a mode excluded for those reasons is no use as a fallback either.
+
+(cherry picked from commit 9bc4540bccb568b67c74b0d23c059d3bf10fd581)
+---
+ xbmc/windowing/Resolution.cpp | 29 +++++++++++++++++++++++++----
+ 1 file changed, 25 insertions(+), 4 deletions(-)
+
+diff --git a/xbmc/windowing/Resolution.cpp b/xbmc/windowing/Resolution.cpp
+index d20fce8ced..b4f5897fae 100644
+--- a/xbmc/windowing/Resolution.cpp
++++ b/xbmc/windowing/Resolution.cpp
+@@ -105,6 +105,13 @@ bool SameTiming(const RESOLUTION_INFO& a, const RESOLUTION_INFO& b)
+ //! against @p width x @p height, the size of one eye, rather than against the mode in
+ //! use. Every HDMI 3D mode is 1080 or 720 line based, so a 4K desktop otherwise
+ //! excludes the lot of them and there is nothing left to be stereoscopic in.
++//!
++//! And where one eye is larger than every 3D mode the display has - HDMI defines no
++//! 3D timing above 1080 lines, so any 4K stereoscopic source - keep the modes the
++//! floor turned down rather than none. Not downgrading is a sharpness heuristic, and
++//! it has nothing to say when the alternative is showing 3D content flat: the eye is
++//! scaled down to a mode either way, by the sink after it is told to expect 3D, or by
++//! the renderer before it is not.
+ std::vector<RESOLUTION> Find3DCandidates(const std::vector<CVariant>& indexList,
+                                          bool noWhiteList,
+                                          int width,
+@@ -115,6 +122,7 @@ std::vector<RESOLUTION> Find3DCandidates(const std::vector<CVariant>& indexList,
+   CServiceBroker::GetWinSystem()->GetGfxContext().GetAllowedResolutions(allowed);
+ 
+   std::vector<RESOLUTION> candidates;
++  std::vector<RESOLUTION> belowFloor;
+ 
+   for (const RESOLUTION res : allowed)
+   {
+@@ -124,15 +132,19 @@ std::vector<RESOLUTION> Find3DCandidates(const std::vector<CVariant>& indexList,
+ 
+     if (noWhiteList)
+     {
+-      const auto [baseWidth, baseHeight] = BaseGeometry(info);
+-
+       // Scan type has to match the GUI, as it does for a 2D candidate, and the half
+       // refresh rates left out there are no more playable in 3D.
+-      if (baseWidth < width || baseHeight < height ||
+-          (info.dwFlags & D3DPRESENTFLAG_INTERLACED) !=
++      if ((info.dwFlags & D3DPRESENTFLAG_INTERLACED) !=
+               (curr.dwFlags & D3DPRESENTFLAG_INTERLACED) ||
+           (info.fRefreshRate <= 30 && !MathUtils::FloatEquals(info.fRefreshRate, 24.0f, 0.1f)))
+         continue;
++
++      const auto [baseWidth, baseHeight] = BaseGeometry(info);
++      if (baseWidth < width || baseHeight < height)
++      {
++        belowFloor.push_back(res);
++        continue;
++      }
+     }
+     else if (std::ranges::none_of(indexList, [&info](const CVariant& mode)
+                                   { return SameTiming(NativeModeInfo(mode), info); }))
+@@ -141,6 +153,15 @@ std::vector<RESOLUTION> Find3DCandidates(const std::vector<CVariant>& indexList,
+     candidates.push_back(res);
+   }
+ 
++  if (candidates.empty() && !belowFloor.empty())
++  {
++    CLog::Log(LOGDEBUG,
++              "[WHITELIST] No 3D mode is as large as one eye ({}x{}), considering the smaller "
++              "ones rather than losing 3D",
++              width, height);
++    return belowFloor;
++  }
++
+   return candidates;
+ }
+ 

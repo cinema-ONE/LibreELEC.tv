@@ -1,0 +1,97 @@
+From 8b7dc6e87b8dea0138ca462878aff20204016682 Mon Sep 17 00:00:00 2001
+From: Dom Cobley <popcornmix@gmail.com>
+Date: Sun, 26 Jul 2026 17:20:17 +0100
+Subject: [PATCH 11/22] BaseRenderer: correct per-eye aspect for full
+ side-by-side / top-and-bottom
+
+For a "full" side-by-side or top-and-bottom source - two full-resolution eyes
+packed 2x wide or 2x tall, e.g. 3840x1080 SBS or 1998x2200 TAB from a file with
+square pixels - the declared aspect ratio describes the whole packed frame.
+After cropping one eye the renderer applied that full-frame aspect to the
+half-size crop, so each eye came out distorted: a 16:9 SBS eye squashed to half
+height, a 1.85:1 TAB eye squeezed narrow.
+
+Add GetPerEyeAspectRatio(). When the packed aspect falls outside the range a
+single frame can plausibly have (roughly 4:3 to Cinemascope) it corrects to the
+per-eye aspect: halved for an over-wide SBS packing, doubled for an over-tall
+TAB packing. Nothing in the picture distinguishes full from half packing, so the
+range test is the discriminator; half packed sources squeeze each eye into a
+normal-looking frame, stay inside the range, and are unchanged - their squeeze
+is handled by the display mode's pixel ratio.
+
+Applied in ManageRenderArea() only when an eye has actually been cropped, i.e.
+the current RenderStereoView is LEFT or RIGHT, and in the direct-to-plane
+renderer's stereo path. Non-stereoscopic sources and every renderer that does
+not crop an eye are unaffected.
+
+(cherry picked from commit 7e39da1483b67983b5d7ca98dde604a1e4104823)
+---
+ .../VideoRenderers/BaseRenderer.cpp           | 26 ++++++++++++++++++-
+ .../VideoPlayer/VideoRenderers/BaseRenderer.h | 12 +++++++++
+ 2 files changed, 37 insertions(+), 1 deletion(-)
+
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/BaseRenderer.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/BaseRenderer.cpp
+index 604999e42e..d116b73c22 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/BaseRenderer.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/BaseRenderer.cpp
+@@ -348,12 +348,36 @@ void CBaseRenderer::ManageRenderArea()
+       break;
+   }
+ 
++  // Only a cropped eye needs the per-eye aspect; a full frame keeps its own.
++  const bool eyeCropped =
++      (stereo_view == RenderStereoView::LEFT || stereo_view == RenderStereoView::RIGHT);
++
+   CalcNormalRenderRect(m_viewRect.x1, m_viewRect.y1, m_viewRect.Width(), m_viewRect.Height(),
+-                       GetAspectRatio() * CDisplaySettings::GetInstance().GetPixelRatio(),
++                       (eyeCropped ? GetPerEyeAspectRatio() : GetAspectRatio()) *
++                           CDisplaySettings::GetInstance().GetPixelRatio(),
+                        CDisplaySettings::GetInstance().GetZoomAmount(),
+                        CDisplaySettings::GetInstance().GetVerticalShift());
+ }
+ 
++float CBaseRenderer::GetPerEyeAspectRatio() const
++{
++  const float ratio = GetAspectRatio();
++
++  // A full side-by-side packing is wider than any single frame can be (2.4 is
++  // beyond Cinemascope) and a full top-and-bottom packing is taller than 4:3.
++  // A half packing squeezes each eye into a normal-looking frame, so it stays
++  // inside that range and is left to the display mode's pixel ratio.
++  switch (CONF_FLAGS_STEREO_MODE_MASK(m_iFlags))
++  {
++    case CONF_FLAGS_STEREO_MODE_SBS:
++      return ratio > 2.4f ? ratio * 0.5f : ratio;
++    case CONF_FLAGS_STEREO_MODE_TAB:
++      return ratio < 1.3f ? ratio * 2.0f : ratio;
++    default:
++      return ratio;
++  }
++}
++
+ EShaderFormat CBaseRenderer::GetShaderFormat()
+ {
+   EShaderFormat ret = SHADER_NONE;
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/BaseRenderer.h b/xbmc/cores/VideoPlayer/VideoRenderers/BaseRenderer.h
+index 4efda66506..74c3a51594 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/BaseRenderer.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/BaseRenderer.h
+@@ -126,6 +126,18 @@ protected:
+   void CalcNormalRenderRect(float offsetX, float offsetY, float width, float height,
+                             float inputFrameRatio, float zoomAmount, float verticalShift);
+   void CalculateFrameAspectRatio(unsigned int desired_width, unsigned int desired_height);
++
++  /*!
++   * \brief Aspect ratio of a single eye of a packed stereoscopic source.
++   *
++   * For a "full" side-by-side / top-and-bottom source the declared aspect ratio
++   * describes the whole packed frame, so one eye is half (SBS) or double (TAB)
++   * that. Corrected only when the declared ratio falls outside the range a
++   * single frame can plausibly have, so "half" packed sources and all
++   * non-stereoscopic sources are returned unchanged.
++   */
++  float GetPerEyeAspectRatio() const;
++
+   virtual void ManageRenderArea();
+   virtual void ReorderDrawPoints();
+   virtual EShaderFormat GetShaderFormat();

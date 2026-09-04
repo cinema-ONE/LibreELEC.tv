@@ -1,0 +1,157 @@
+From 1091b194345eed32fe5c7006323286b9daca8c8f Mon Sep 17 00:00:00 2001
+From: Dom Cobley <popcornmix@gmail.com>
+Date: Fri, 14 Aug 2026 19:15:51 +0100
+Subject: [PATCH 18/22] windowing: name the stereoscopic layout wherever a mode
+ is logged
+
+A mode's strMode is its geometry, scan type and refresh rate, which does not
+distinguish a half 3D mode from the 2D mode of the same timing: both print as
+"1920x1080 @ 50.000000 Hz". So no log line said which layout was being signalled,
+or whether 3D was signalled at all. Frame packing was identifiable only by
+accident, its packed scanout giving it a geometry of its own.
+
+The cost of that is not hypothetical. "Display resolution ADJUST : 1920x1080 @
+23.976080 Hz (48)" is LOGINFO, the line to hand when someone has not enabled
+debug logging, and it cannot answer the first question asked of it. Which mode a
+resolution index names could only be recovered by counting through the mode
+enumeration and adding RES_CUSTOM. And the enumeration itself printed the 3D
+variants identically to their 2D twins, so CLog collapsed them as duplicate
+messages - the layouts a display offers had to be guessed from which timings the
+HDMI specification makes each layout mandatory for, which is a guess that can be
+wrong.
+
+So add the layout to RESOLUTION_INFO, as a tag to append: the separator belongs to
+the tag and a 2D mode's tag is empty, so those lines read exactly as they did.
+Name it at the four places a mode is described - the resolution enumeration, the
+ADJUST line, the native 3D mode match and the arrangement change - and tell frame
+packing from the half top-and-bottom layout it is presented as by iBlanking, which
+only a packed scanout has.
+
+(cherry picked from commit 5c75f31f520e24281a0943e40f284cf19c0252a0)
+---
+ xbmc/windowing/Resolution.cpp       | 30 +++++++++++++++++++++--------
+ xbmc/windowing/Resolution.h         | 14 ++++++++++++++
+ xbmc/windowing/gbm/WinSystemGbm.cpp | 13 +++++++++----
+ 3 files changed, 45 insertions(+), 12 deletions(-)
+
+diff --git a/xbmc/windowing/Resolution.cpp b/xbmc/windowing/Resolution.cpp
+index ee907e96c4..8b322ef9ce 100644
+--- a/xbmc/windowing/Resolution.cpp
++++ b/xbmc/windowing/Resolution.cpp
+@@ -288,6 +288,17 @@ float RESOLUTION_INFO::DisplayRatio() const
+   return iWidth * fPixelRatio / iHeight;
+ }
+ 
++std::string RESOLUTION_INFO::StereoLayoutTag() const
++{
++  if (dwFlags & D3DPRESENTFLAG_MODE3DSBS)
++    return " 3D sbs";
++
++  if (dwFlags & D3DPRESENTFLAG_MODE3DTB)
++    return iBlanking > 0 ? " 3D fp" : " 3D tab";
++
++  return "";
++}
++
+ RESOLUTION CResolutionUtils::ChooseBestResolution(float fps, int width, int height, bool is3D)
+ {
+   RESOLUTION res = CServiceBroker::GetWinSystem()->GetGfxContext().GetVideoResolution();
+@@ -311,8 +322,9 @@ RESOLUTION CResolutionUtils::ChooseBestResolution(float fps, int width, int heig
+     }
+   }
+ 
+-  CLog::Log(LOGINFO, "Display resolution ADJUST : {} ({}) (weight: {:.3f})",
+-            CServiceBroker::GetWinSystem()->GetGfxContext().GetResInfo(res).strMode, res, weight);
++  const RESOLUTION_INFO chosen = CServiceBroker::GetWinSystem()->GetGfxContext().GetResInfo(res);
++  CLog::Log(LOGINFO, "Display resolution ADJUST : {}{} ({}) (weight: {:.3f})", chosen.strMode,
++            chosen.StereoLayoutTag(), res, weight);
+   return res;
+ }
+ 
+@@ -350,10 +362,11 @@ RenderStereoMode CResolutionUtils::ChooseStereoArrangement(RenderStereoMode want
+   // and which half of the frame each eye lives in is then theirs to decide.
+   if (BetterMatch(otherMatch, wantedMatch))
+   {
++    const RESOLUTION_INFO& mode =
++        CDisplaySettings::GetInstance().GetResolutionInfo(otherMatch.resolution);
+     CLog::Log(LOGDEBUG,
+-              "Stereoscopic 3D: changing the output arrangement to suit display mode {} at {}",
+-              CDisplaySettings::GetInstance().GetResolutionInfo(otherMatch.resolution).strMode,
+-              StereoTierName(otherMatch.tier));
++              "Stereoscopic 3D: changing the output arrangement to suit display mode {}{} at {}",
++              mode.strMode, mode.StereoLayoutTag(), StereoTierName(otherMatch.tier));
+     return other;
+   }
+ 
+@@ -475,9 +488,10 @@ void CResolutionUtils::FindResolutionFromWhitelist(float fps, int width, int hei
+     if (match.resolution != RES_INVALID)
+     {
+       resolution = match.resolution;
+-      CLog::Log(LOGDEBUG, "[WHITELIST] Matched a native 3D mode {} ({}) at {}",
+-                CServiceBroker::GetWinSystem()->GetGfxContext().GetResInfo(resolution).strMode,
+-                resolution, StereoTierName(match.tier));
++      const RESOLUTION_INFO matched =
++          CServiceBroker::GetWinSystem()->GetGfxContext().GetResInfo(resolution);
++      CLog::Log(LOGDEBUG, "[WHITELIST] Matched a native 3D mode {}{} ({}) at {}", matched.strMode,
++                matched.StereoLayoutTag(), resolution, StereoTierName(match.tier));
+       return;
+     }
+ 
+diff --git a/xbmc/windowing/Resolution.h b/xbmc/windowing/Resolution.h
+index 8c93a77da9..d6dafd1f8f 100644
+--- a/xbmc/windowing/Resolution.h
++++ b/xbmc/windowing/Resolution.h
+@@ -115,6 +115,20 @@ struct RESOLUTION_INFO
+ public:
+   RESOLUTION_INFO(int width = 1280, int height = 720, float aspect = 0, const std::string &mode = "");
+   float DisplayRatio() const;
++
++  /*!
++   * \brief The stereoscopic layout the mode transmits, to append to a mode in a log
++   *
++   * " 3D sbs", " 3D tab" or " 3D fp", and empty for a 2D mode - the separator included so
++   * that a 2D mode's line reads as it always did.
++   *
++   * strMode carries the geometry, the scan type and the refresh rate, none of which
++   * distinguishes a half 3D mode from the 2D mode of the same timing - they print
++   * identically - so a log naming only that cannot say whether 3D was signalled at all.
++   * Frame packing is told apart from the half top-and-bottom layout it is presented as by
++   * iBlanking, which the packed scanout needs and no other mode has.
++   */
++  std::string StereoLayoutTag() const;
+ };
+ 
+ class CResolutionUtils
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.cpp b/xbmc/windowing/gbm/WinSystemGbm.cpp
+index 83e2085816..d3750f4cea 100644
+--- a/xbmc/windowing/gbm/WinSystemGbm.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbm.cpp
+@@ -224,9 +224,10 @@ void CWinSystemGbm::UpdateResolutions()
+     CDisplaySettings::GetInstance().AddResolutionInfo(current);
+     CDisplaySettings::GetInstance().GetResolutionInfo(RES_DESKTOP) = current;
+ 
+-    CLog::Log(LOGINFO, "Found resolution {}x{} with {}x{}{} @ {:f} Hz", current.iWidth,
++    CLog::Log(LOGINFO, "Found resolution {}x{} with {}x{}{} @ {:f} Hz{}", current.iWidth,
+               current.iHeight, current.iScreenWidth, current.iScreenHeight,
+-              current.dwFlags & D3DPRESENTFLAG_INTERLACED ? "i" : "", current.fRefreshRate);
++              current.dwFlags & D3DPRESENTFLAG_INTERLACED ? "i" : "", current.fRefreshRate,
++              current.StereoLayoutTag());
+   }
+   else
+   {
+@@ -244,9 +245,13 @@ void CWinSystemGbm::UpdateResolutions()
+         CDisplaySettings::GetInstance().GetResolutionInfo(RES_DESKTOP) = res;
+       }
+ 
+-      CLog::Log(LOGINFO, "Found resolution {}x{} with {}x{}{} @ {:f} Hz", res.iWidth, res.iHeight,
++      // The layout matters as much as the geometry here: without it a half 3D mode prints
++      // exactly like the 2D mode of the same timing, and the log dedupe swallows it as a
++      // duplicate message.
++      CLog::Log(LOGINFO, "Found resolution {}x{} with {}x{}{} @ {:f} Hz{}", res.iWidth, res.iHeight,
+                 res.iScreenWidth, res.iScreenHeight,
+-                res.dwFlags & D3DPRESENTFLAG_INTERLACED ? "i" : "", res.fRefreshRate);
++                res.dwFlags & D3DPRESENTFLAG_INTERLACED ? "i" : "", res.fRefreshRate,
++                res.StereoLayoutTag());
+     }
+   }
+ 

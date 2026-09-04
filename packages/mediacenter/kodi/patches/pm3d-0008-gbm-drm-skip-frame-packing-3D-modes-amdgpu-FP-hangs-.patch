@@ -1,0 +1,32 @@
+From 933b6d41fd706e7236e90dd9a2289c530483078e Mon Sep 17 00:00:00 2001
+From: cinemaONE <35371193+cinema-ONE@users.noreply.github.com>
+Date: Fri, 4 Sep 2026 16:31:23 +0200
+Subject: [PATCH 08/22] gbm/drm: skip frame-packing 3D modes (amdgpu FP hangs;
+ force TAB)
+
+---
+ xbmc/windowing/gbm/drm/DRMUtils.cpp | 11 ++++++-----
+ 1 file changed, 6 insertions(+), 5 deletions(-)
+
+diff --git a/xbmc/windowing/gbm/drm/DRMUtils.cpp b/xbmc/windowing/gbm/drm/DRMUtils.cpp
+index 3e126295e5..e9e3fbdded 100644
+--- a/xbmc/windowing/gbm/drm/DRMUtils.cpp
++++ b/xbmc/windowing/gbm/drm/DRMUtils.cpp
+@@ -875,11 +875,12 @@ std::vector<RESOLUTION_INFO> CDRMUtils::GetModes()
+   {
+     drmModeModeInfoPtr mode = m_connector->GetModeForIndex(i);
+ 
+-    // Interlaced frame packing cannot be driven from a progressive framebuffer;
+-    // hide it so it is never picked for 3D playback. strId stays the connector
+-    // mode index (SetMode() looks the mode up by it), so skip without renumbering.
+-    if ((mode->flags & DRM_MODE_FLAG_3D_MASK) == DRM_MODE_FLAG_3D_FRAME_PACKING &&
+-        (mode->flags & DRM_MODE_FLAG_INTERLACE))
++    // Frame packing hangs amdgpu's atomic commit: DC does not double the CRTC
++    // timing (unlike vc4), so a vdisplay+vtotal plane exceeds the CRTC. Skip all
++    // frame-packing modes for now so the selection picks top-and-bottom, which
++    // needs no doubling. strId stays the connector mode index (SetMode() looks
++    // the mode up by it), so skip without renumbering.
++    if ((mode->flags & DRM_MODE_FLAG_3D_MASK) == DRM_MODE_FLAG_3D_FRAME_PACKING)
+       continue;
+ 
+     RESOLUTION_INFO res = GetResolutionInfo(mode);
