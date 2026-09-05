@@ -1,0 +1,13 @@
+--- a/drivers/gpu/drm/amd/display/modules/info_packet/info_packet.c	2026-09-05 13:28:17
++++ b/drivers/gpu/drm/amd/display/modules/info_packet/info_packet.c	2026-09-05 13:28:17
+@@ -556,6 +556,10 @@
+ 			case TIMING_3D_FORMAT_TOP_AND_BOTTOM:
+ 			case TIMING_3D_FORMAT_TB_SW_PACKED:
+ 				info_packet->sb[5] = (0x6 << 4);
++				/* Some sinks (JVC D-ILA) only engage TAB when the
++				 * 3D_Ext_Data byte is present, as Amlogic sources send it.
++				 */
++				length = 6;
+ 				break;
+ 
+ 			default:
