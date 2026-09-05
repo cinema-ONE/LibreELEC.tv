@@ -8,12 +8,12 @@ diff -ruN /private/tmp/claude-501/-Users-adrian-code-xbmc-xbmc/6566a1a5-410d-46f
 -	timing_out->timing_3d_format = TIMING_3D_FORMAT_NONE;
 +	switch (mode_in->flags & DRM_MODE_FLAG_3D_MASK) {
 +	case DRM_MODE_FLAG_3D_TOP_AND_BOTTOM:
-+		timing_out->timing_3d_format = TIMING_3D_FORMAT_TOP_AND_BOTTOM;
++		timing_out->timing_3d_format = TIMING_3D_FORMAT_TB_SW_PACKED;
 +		stream->view_format = VIEW_3D_FORMAT_TOP_AND_BOTTOM;
 +		break;
 +	case DRM_MODE_FLAG_3D_SIDE_BY_SIDE_HALF:
 +	case DRM_MODE_FLAG_3D_SIDE_BY_SIDE_FULL:
-+		timing_out->timing_3d_format = TIMING_3D_FORMAT_SIDE_BY_SIDE;
++		timing_out->timing_3d_format = TIMING_3D_FORMAT_SBS_SW_PACKED;
 +		stream->view_format = VIEW_3D_FORMAT_SIDE_BY_SIDE;
 +		break;
 +	case DRM_MODE_FLAG_3D_FRAME_PACKING:
