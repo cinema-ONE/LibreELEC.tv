@@ -1,0 +1,120 @@
+From 2263ec47fcfaf32ce4945d5c4b00b6f5c9e8570c Mon Sep 17 00:00:00 2001
+From: Dom Cobley <popcornmix@gmail.com>
+Date: Sat, 1 Aug 2026 12:27:07 +0100
+Subject: [PATCH 01/12] DVDDemuxFFmpeg: read the stereoscopic mode from
+ AVStereo3D side data
+
+Kodi learned a stream's stereoscopic layout from exactly two places: the
+Matroska stereo_mode tag, and the asf/wmv Stereoscopic/StereoscopicLayout pair.
+An mp4 or mov that declares its layout in the container - through the
+QuickTime vexu/eyes boxes, an mkv-to-mp4 remux carrying a stereo3d box, or an
+SEI frame packing arrangement the decoder promotes - was played flat, because
+none of that reaches the AVDictionary the two existing paths read.
+
+ffmpeg already parses all of it and normalises the result into an AVStereo3D
+exported as AV_PKT_DATA_STEREO3D on codecpar->coded_side_data. Read it in the
+same place, and with the same av_packet_side_data_get() idiom, as the Dolby
+Vision, HDR and display matrix side data just above, and map AVStereo3DType
+onto the matroska vocabulary Kodi uses internally.
+
+AV_STEREO3D_FLAG_INVERT means the right or bottom view holds the left eye, so
+it selects between the _lr and _rl spelling of each layout. Types with no Kodi
+equivalent - side by side quincunx, and the unspecified type used for streams
+whose views are coded separately rather than packed - map to nothing and leave
+the stream untagged, which is what happens today.
+
+Side data wins over the metadata tags, which stay as the fallback, so Matroska
+and asf behaviour is unchanged.
+
+(cherry picked from commit 7aa7a9e4eee75e23d0a30d415404f75da41b48d8)
+---
+ .../DVDDemuxers/DVDDemuxFFmpeg.cpp            | 41 +++++++++++++++++--
+ .../VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h  |  1 +
+ 2 files changed, 39 insertions(+), 3 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
+index 4ce795dd6a..c1a06c98aa 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
+@@ -63,6 +63,7 @@ extern "C"
+ #include <libavutil/dovi_meta.h>
+ #include <libavutil/opt.h>
+ #include <libavutil/pixdesc.h>
++#include <libavutil/stereo3d.h>
+ }
+ 
+ using namespace KODI::UTILS;
+@@ -1810,14 +1811,16 @@ CDemuxStream* CDVDDemuxFFmpeg::AddStream(int streamIdx)
+         }
+ 
+         // detect stereoscopic mode
+-        std::string stereoMode = GetStereoModeFromMetadata(pStream->metadata);
+-          // check for metadata in file if detection in stream failed
++        std::string stereoMode = GetStereoModeFromSideData(pStream);
++        // fall back to the container metadata tags (matroska, asf/wmv)
++        if (stereoMode.empty())
++          stereoMode = GetStereoModeFromMetadata(pStream->metadata);
++        // check for metadata in file if detection in stream failed
+         if (stereoMode.empty())
+           stereoMode = GetStereoModeFromMetadata(m_pFormatContext->metadata);
+         if (!stereoMode.empty())
+           st->stereo_mode = stereoMode;
+ 
+-
+         if (m_pInput->IsStreamType(DVDSTREAM_TYPE_DVD))
+         {
+           if (pStream->codecpar->codec_id == AV_CODEC_ID_PROBE)
+@@ -2358,6 +2361,38 @@ std::string CDVDDemuxFFmpeg::GetStereoModeFromMetadata(AVDictionary* pMetadata)
+   return stereoMode;
+ }
+ 
++std::string CDVDDemuxFFmpeg::GetStereoModeFromSideData(const AVStream* pStream)
++{
++  const AVPacketSideData* sideData =
++      av_packet_side_data_get(pStream->codecpar->coded_side_data,
++                              pStream->codecpar->nb_coded_side_data, AV_PKT_DATA_STEREO3D);
++  if (!sideData || sideData->size < sizeof(AVStereo3D))
++    return "";
++
++  const auto* stereo = reinterpret_cast<const AVStereo3D*>(sideData->data);
++
++  // AV_STEREO3D_FLAG_INVERT: the right/bottom view is the left eye.
++  const bool inverted = (stereo->flags & AV_STEREO3D_FLAG_INVERT) != 0;
++
++  switch (stereo->type)
++  {
++    case AV_STEREO3D_SIDEBYSIDE:
++      return inverted ? "right_left" : "left_right";
++    case AV_STEREO3D_TOPBOTTOM:
++      return inverted ? "bottom_top" : "top_bottom";
++    case AV_STEREO3D_CHECKERBOARD:
++      return inverted ? "checkerboard_rl" : "checkerboard_lr";
++    case AV_STEREO3D_LINES:
++      return inverted ? "row_interleaved_rl" : "row_interleaved_lr";
++    case AV_STEREO3D_COLUMNS:
++      return inverted ? "col_interleaved_rl" : "col_interleaved_lr";
++    case AV_STEREO3D_FRAMESEQUENCE:
++      return inverted ? "block_rl" : "block_lr";
++    default:
++      return "";
++  }
++}
++
+ std::string CDVDDemuxFFmpeg::ConvertCodecToInternalStereoMode(const std::string &mode, const StereoModeConversionMap* conversionMap)
+ {
+   size_t i = 0;
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
+index 08701982a4..27fcff5a51 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
+@@ -137,6 +137,7 @@ protected:
+   unsigned int HLSSelectProgram();
+ 
+   std::string GetStereoModeFromMetadata(AVDictionary* pMetadata);
++  std::string GetStereoModeFromSideData(const AVStream* pStream);
+   std::string ConvertCodecToInternalStereoMode(const std::string& mode, const StereoModeConversionMap* conversionMap);
+ 
+   void GetL16Parameters(int& channels, int& samplerate);
+-- 
+2.55.0
+

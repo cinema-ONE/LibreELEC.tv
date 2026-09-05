@@ -1,0 +1,298 @@
+From 7da1e0d4fc86dd1e513621428d8a47194fd8f7c1 Mon Sep 17 00:00:00 2001
+From: Dom Cobley <popcornmix@gmail.com>
+Date: Thu, 3 Sep 2026 16:07:13 +0100
+Subject: [PATCH 11/12] BlurayDirectory: do not mistake a 3D playlist for a
+ copy of the 2D one beside it
+
+A 3D Blu-ray carries both presentations of its feature, and they are alike in everything the
+duplicate search compares: same length, same chapters, same clip for the base view, and the
+same audio and subtitle streams exposed. What makes one of them 3D is the dependent view
+named in the playlist's extension data, which PlaylistInformation did not carry at all - so
+the two collapsed to one entry, and as the copy dropped was the higher numbered of the pair,
+and the 3D playlist is usually numbered above its 2D twin, what a viewer was left with was
+the 2D one. The disc then plays flat with no sign of a second eye anywhere, and no way to
+ask for one.
+
+The dependent view clips are now carried through and compared. Two presentations that name
+different ones are two presentations. Where only one names any, that is the one kept: its
+base view is the 2D presentation, so a viewer who wants 2D loses nothing (the stereoscopic
+playback mode setting already plays the base view alone), while dropping it costs the disc
+its 3D.
+
+Duplicate removal is also logged now, saying which playlist a discarded one duplicates.
+FilterPlaylists() logs everything else it drops, on the grounds that a playlist removed
+there is otherwise indistinguishable from one that is not on the disc, and this one was the
+exception - which is why two reports of a 3D disc playing flat had nothing in the log to
+explain it, only a count of playlists read that did not add up to what was offered.
+
+Covered by tests: the stereoscopic copy is kept whichever way round the disc numbers the
+pair, and among several 2D copies; two stereoscopic presentations of the same content both
+survive; two copies of the same stereoscopic presentation still collapse to the lowest
+numbered.
+
+(cherry picked from commit 4f6698fc724414dc4435e3b8ee177c341c46875b)
+---
+ xbmc/filesystem/BlurayDirectory.cpp          | 53 +++++++++++++---
+ xbmc/filesystem/DiscDirectoryHelper.h        |  5 ++
+ xbmc/filesystem/bluray/StreamParser.cpp      |  6 ++
+ xbmc/filesystem/test/TestBlurayDirectory.cpp | 64 +++++++++++++++++++-
+ xbmc/filesystem/test/TestStreamParser.cpp    | 39 ++++++++++++
+ 5 files changed, 157 insertions(+), 10 deletions(-)
+
+diff --git a/xbmc/filesystem/BlurayDirectory.cpp b/xbmc/filesystem/BlurayDirectory.cpp
+index 58b48b5105..eb3004d786 100644
+--- a/xbmc/filesystem/BlurayDirectory.cpp
++++ b/xbmc/filesystem/BlurayDirectory.cpp
+@@ -207,23 +207,58 @@ void RemoveDuplicatePlaylists(std::vector<PlaylistInformation>& playlists)
+   // so two playlists sharing a clip but offering different streams are not seen as identical.
+   // The duration is compared as well as the chapters, as two playlists can play the same clips
+   // from the same chapter starts but to different out times (ie. they are distinct cuts).
+-  std::unordered_set<unsigned int> duplicatePlaylists;
++  std::map<unsigned int, unsigned int> duplicatePlaylists; // duplicate -> what it duplicates
+   for (size_t i = 0; i + 1 < playlists.size(); ++i)
+   {
+     for (size_t j = i + 1; j < playlists.size(); ++j)
+     {
+-      if (playlists[i].duration == playlists[j].duration &&
+-          playlists[i].audioStreams == playlists[j].audioStreams &&
+-          playlists[i].pgStreams == playlists[j].pgStreams &&
+-          playlists[i].chapters == playlists[j].chapters &&
+-          playlists[i].clips == playlists[j].clips)
++      if (playlists[i].duration != playlists[j].duration ||
++          playlists[i].audioStreams != playlists[j].audioStreams ||
++          playlists[i].pgStreams != playlists[j].pgStreams ||
++          playlists[i].chapters != playlists[j].chapters ||
++          playlists[i].clips != playlists[j].clips)
++        continue;
++
++      // None of that tells a 3D playlist from the 2D one beside it. A 3D Blu-ray carries both
++      // presentations of its feature, and they differ only in the dependent view named in the
++      // playlist's extension data - same length, same chapters, same clip for the base view,
++      // and the same streams exposed.
++      const bool iIs3D{!playlists[i].dependentViewClips.empty()};
++      const bool jIs3D{!playlists[j].dependentViewClips.empty()};
++
++      // Two stereoscopic presentations of the same content are still two presentations.
++      if (iIs3D && jIs3D && playlists[i].dependentViewClips != playlists[j].dependentViewClips)
++        continue;
++
++      // Where only one is stereoscopic, keep that one. Its base view is the 2D presentation,
++      // so a viewer who wants 2D loses nothing, while dropping it would leave a 3D disc with
++      // no way to reach its second eye - and as the 3D playlist is usually the higher numbered
++      // of the two, that is what keeping the lower number would do.
++      if (iIs3D != jIs3D)
+       {
+-        duplicatePlaylists.emplace(std::max(playlists[i].playlist, playlists[j].playlist));
++        const size_t drop{iIs3D ? j : i};
++        const size_t keep{iIs3D ? i : j};
++        duplicatePlaylists.try_emplace(playlists[drop].playlist, playlists[keep].playlist);
++      }
++      else
++      {
++        const auto [lower, higher]{std::minmax(playlists[i].playlist, playlists[j].playlist)};
++        duplicatePlaylists.try_emplace(higher, lower);
+       }
+     }
+   }
+-  std::erase_if(playlists, [&duplicatePlaylists](const PlaylistInformation& p)
+-                { return duplicatePlaylists.contains(p.playlist); });
++
++  std::erase_if(playlists,
++                [&duplicatePlaylists](const PlaylistInformation& p)
++                {
++                  const auto it{duplicatePlaylists.find(p.playlist)};
++                  if (it == duplicatePlaylists.end())
++                    return false;
++
++                  CLog::LogF(LOGDEBUG, "Discarding playlist {} - duplicate of playlist {}",
++                             p.playlist, it->second);
++                  return true;
++                });
+ }
+ 
+ bool SetStreamDetails(const CURL& url,
+diff --git a/xbmc/filesystem/DiscDirectoryHelper.h b/xbmc/filesystem/DiscDirectoryHelper.h
+index d39bdb225f..a6ed1d0bab 100644
+--- a/xbmc/filesystem/DiscDirectoryHelper.h
++++ b/xbmc/filesystem/DiscDirectoryHelper.h
+@@ -118,6 +118,10 @@ struct PlaylistInformation
+   std::vector<SubtitleStreamInfo> pgStreams;
+   std::string languages;
+ 
++  //! Clips holding the MVC dependent view, one for each play item that has one. Empty
++  //! unless the playlist is a stereoscopic presentation.
++  std::vector<unsigned int> dependentViewClips;
++
+   //! Whether the playlist carries a secondary video stream, ie. it presents the content
+   //! picture-in-picture (see IsPictureInPicturePresentation)
+   bool hasSecondaryVideo{false};
+@@ -133,6 +137,7 @@ struct PlaylistInformation
+     audioStreams.clear();
+     pgStreams.clear();
+     languages.clear();
++    dependentViewClips.clear();
+     hasSecondaryVideo = false;
+   }
+ };
+diff --git a/xbmc/filesystem/bluray/StreamParser.cpp b/xbmc/filesystem/bluray/StreamParser.cpp
+index 15fcbe3ff7..d002cc07eb 100644
+--- a/xbmc/filesystem/bluray/StreamParser.cpp
++++ b/xbmc/filesystem/bluray/StreamParser.cpp
+@@ -359,6 +359,12 @@ void CStreamParser::ConvertBlurayPlaylistInformation(const BlurayPlaylistInforma
+     p.clips.emplace_back(clip.clip);
+     p.clipDuration[clip.clip] = clip.duration;
+   }
++  p.dependentViewClips.reserve(b.extensionSubPlayItems.size());
++  for (const SubPlayItemInformation& subPlayItem : b.extensionSubPlayItems)
++  {
++    if (!subPlayItem.clips.empty())
++      p.dependentViewClips.emplace_back(subPlayItem.clips.front().clip);
++  }
+ 
+   const DefaultStreams defaults{GetDefaultStreams(b)};
+ 
+diff --git a/xbmc/filesystem/test/TestBlurayDirectory.cpp b/xbmc/filesystem/test/TestBlurayDirectory.cpp
+index cb125ce04a..8a30025141 100644
+--- a/xbmc/filesystem/test/TestBlurayDirectory.cpp
++++ b/xbmc/filesystem/test/TestBlurayDirectory.cpp
+@@ -40,13 +40,15 @@ namespace
+ PlaylistInformation MakePlaylist(unsigned int playlist,
+                                  std::chrono::milliseconds duration,
+                                  std::vector<unsigned int> clips,
+-                                 std::vector<std::chrono::milliseconds> chapters = {1min})
++                                 std::vector<std::chrono::milliseconds> chapters = {1min},
++                                 std::vector<unsigned int> dependentViewClips = {})
+ {
+   PlaylistInformation info;
+   info.playlist = playlist;
+   info.duration = duration;
+   info.clips = std::move(clips);
+   info.chapters = std::move(chapters);
++  info.dependentViewClips = std::move(dependentViewClips);
+   return info;
+ }
+ 
+@@ -228,6 +230,66 @@ TEST_F(TestBlurayDirectory, FilterPlaylists_RemovesAllCopiesOfADuplicate)
+   EXPECT_EQ(PlaylistNumbers(playlists), (std::vector<unsigned int>{800u, 803u}));
+ }
+ 
++// A 3D Blu-ray carries both presentations of its feature, alike in everything the comparison
++// looks at bar the dependent view. The stereoscopic one is kept whichever way round the disc
++// numbers them - its base view is the 2D presentation, so nothing is lost, and it is usually
++// the higher numbered of the two.
++TEST_F(TestBlurayDirectory, FilterPlaylists_KeepsTheStereoscopicCopyOfADuplicate)
++{
++  std::vector<PlaylistInformation> playlists{
++      MakePlaylist(800u, 2h, {1u}),
++      MakePlaylist(801u, 2h, {1u}, {1min}, {2u}),
++  };
++
++  EXPECT_TRUE(FilterPlaylists(playlists));
++  EXPECT_EQ(PlaylistNumbers(playlists), std::vector<unsigned int>{801u});
++
++  playlists = {
++      MakePlaylist(800u, 2h, {1u}, {1min}, {2u}),
++      MakePlaylist(801u, 2h, {1u}),
++  };
++
++  EXPECT_TRUE(FilterPlaylists(playlists));
++  EXPECT_EQ(PlaylistNumbers(playlists), std::vector<unsigned int>{800u});
++}
++
++// Two stereoscopic presentations of the same content are still two presentations
++TEST_F(TestBlurayDirectory, FilterPlaylists_KeepsPlaylistsDifferingByDependentView)
++{
++  std::vector<PlaylistInformation> playlists{
++      MakePlaylist(800u, 2h, {1u}, {1min}, {2u}),
++      MakePlaylist(801u, 2h, {1u}, {1min}, {3u}),
++  };
++
++  EXPECT_TRUE(FilterPlaylists(playlists));
++  EXPECT_EQ(PlaylistNumbers(playlists), (std::vector<unsigned int>{800u, 801u}));
++}
++
++// Two copies of the same stereoscopic presentation collapse like any other pair
++TEST_F(TestBlurayDirectory, FilterPlaylists_RemovesDuplicateStereoscopicPlaylists)
++{
++  std::vector<PlaylistInformation> playlists{
++      MakePlaylist(801u, 2h, {1u}, {1min}, {2u}),
++      MakePlaylist(800u, 2h, {1u}, {1min}, {2u}),
++  };
++
++  EXPECT_TRUE(FilterPlaylists(playlists));
++  EXPECT_EQ(PlaylistNumbers(playlists), std::vector<unsigned int>{800u});
++}
++
++// The stereoscopic playlist survives however many 2D copies stand beside it
++TEST_F(TestBlurayDirectory, FilterPlaylists_KeepsTheStereoscopicCopyAmongSeveral)
++{
++  std::vector<PlaylistInformation> playlists{
++      MakePlaylist(800u, 2h, {1u}),
++      MakePlaylist(801u, 2h, {1u}, {1min}, {2u}),
++      MakePlaylist(802u, 2h, {1u}),
++  };
++
++  EXPECT_TRUE(FilterPlaylists(playlists));
++  EXPECT_EQ(PlaylistNumbers(playlists), std::vector<unsigned int>{801u});
++}
++
+ // What a playlist offers has to survive being recorded, or the movie and episode searches decide
+ // on a playlist described differently to the one the disc holds
+ TEST_F(TestBlurayDirectory, ProcessPlaylist_CarriesThePlaylistThrough)
+diff --git a/xbmc/filesystem/test/TestStreamParser.cpp b/xbmc/filesystem/test/TestStreamParser.cpp
+index 3a8a36be41..a77b14d0ce 100644
+--- a/xbmc/filesystem/test/TestStreamParser.cpp
++++ b/xbmc/filesystem/test/TestStreamParser.cpp
+@@ -71,6 +71,19 @@ BlurayPlaylistInformation MakePlaylist(unsigned int playlist,
+   return info;
+ }
+ 
++// Give the playlist a stereoscopic sub-path, naming the clip that holds the dependent view of
++// each play item.
++void AddDependentView(BlurayPlaylistInformation& info, const std::vector<unsigned int>& clips)
++{
++  for (unsigned int i = 0; i < clips.size(); ++i)
++  {
++    SubPlayItemInformation subPlayItem;
++    subPlayItem.syncPlayItemId = i;
++    subPlayItem.clips.emplace_back(clips[i], "M2TS");
++    info.extensionSubPlayItems.emplace_back(std::move(subPlayItem));
++  }
++}
++
+ std::vector<std::string> AudioLanguagesOf(const PlaylistInformation& p)
+ {
+   std::vector<std::string> languages;
+@@ -189,3 +202,29 @@ TEST(TestStreamParser, PlaylistWithoutAStreamNumberTableFallsBackToTheClip)
+   EXPECT_TRUE(deferred.audioStreams.empty());
+   EXPECT_TRUE(deferred.pgStreams.empty());
+ }
++
++// The dependent view is what tells a 3D playlist from the 2D one beside it, which is otherwise
++// alike in everything the directory records, so it has to be carried through
++TEST(TestStreamParser, TheDependentViewClipsAreCarriedThrough)
++{
++  const std::vector<StreamInformation> audio{MakeStream(ENCODING_TYPE::AUDIO_DTSHD_MASTER, 0x1100,
++                                                        "eng")};
++  const std::vector<StreamInformation> subtitles{MakeStream(ENCODING_TYPE::SUB_PG, 0x1200, "eng")};
++
++  BlurayPlaylistInformation flat{MakePlaylist(800, 1, audio, subtitles)};
++  PlaylistInformation p;
++  CStreamParser::ConvertBlurayPlaylistInformation(flat, p, {}, StreamDetails::INCLUDE);
++  EXPECT_TRUE(p.dependentViewClips.empty());
++
++  BlurayPlaylistInformation stereoscopic{MakePlaylist(801, 1, audio, subtitles)};
++  AddDependentView(stereoscopic, {2, 3});
++  PlaylistInformation p3d;
++  CStreamParser::ConvertBlurayPlaylistInformation(stereoscopic, p3d, {}, StreamDetails::INCLUDE);
++  EXPECT_EQ(p3d.dependentViewClips, (std::vector<unsigned int>{2, 3}));
++
++  // The playlist search is answered without reading the clips, and needs it just the same
++  PlaylistInformation deferred;
++  CStreamParser::ConvertBlurayPlaylistInformation(stereoscopic, deferred, {},
++                                                  StreamDetails::DEFER);
++  EXPECT_EQ(deferred.dependentViewClips, (std::vector<unsigned int>{2, 3}));
++}
+-- 
+2.55.0
+

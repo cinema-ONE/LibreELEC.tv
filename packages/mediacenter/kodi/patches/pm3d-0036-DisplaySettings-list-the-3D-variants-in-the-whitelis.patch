@@ -1,0 +1,192 @@
+From 4f5ea2d986423bc3547bf9953014d6e97c830848 Mon Sep 17 00:00:00 2001
+From: cinemaONE <35371193+cinema-ONE@users.noreply.github.com>
+Date: Sat, 5 Sep 2026 16:38:42 +0200
+Subject: [PATCH 12/12] DisplaySettings: list the 3D variants in the whitelist,
+ frame packing as ...ptabfrp
+
+CoreELEC 22 lets a viewer whitelist the 3D modes a display actually handles
+(this projector: frame packing and top-and-bottom at 1080p24, not
+side-by-side) with identifiers such as 0192001080024.00000ptabfrp. Offer the
+same here: list the 3D variants beside their 2D timing, name a frame-packing
+mode by its per-eye height with the frp suffix, and have the identifier
+parser tell frame packing from plain top-and-bottom by iBlanking, which is
+the only thing that distinguishes them. Whitelisting a 3D mode outright was
+already accepted by the 3D candidate search.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ xbmc/settings/DisplaySettings.cpp | 79 ++++++++++++++++---------------
+ xbmc/settings/DisplaySettings.h   |  8 +++-
+ 2 files changed, 47 insertions(+), 40 deletions(-)
+
+diff --git a/xbmc/settings/DisplaySettings.cpp b/xbmc/settings/DisplaySettings.cpp
+index f9e19e8a9a..50d5efc9a6 100644
+--- a/xbmc/settings/DisplaySettings.cpp
++++ b/xbmc/settings/DisplaySettings.cpp
+@@ -62,23 +62,6 @@ float square_error(float x, float y)
+   return std::max(yonx, xony);
+ }
+ 
+-//! @brief True when @p setting is the setting @p id names, or the element definition of
+-//!        the list setting it names.
+-//!
+-//! An options filler for a list setting is handed that definition rather than the list
+-//! itself - the constraint is deserialized onto it, and it is what
+-//! CSettingString::UpdateDynamicOptions() passes - and the settings manager derives its
+-//! id by suffixing the list's (see CSettingsManager::CreateSetting).
+-bool IsSettingOrItsListDefinition(const std::shared_ptr<const CSetting>& setting,
+-                                  std::string_view id)
+-{
+-  if (!setting)
+-    return false;
+-
+-  const std::string& settingId = setting->GetId();
+-  return settingId == id || settingId == std::string(id).append(".definition");
+-}
+-
+ std::string ModeFlagsToString(unsigned int flags, bool identifier)
+ {
+   std::string res;
+@@ -99,6 +82,15 @@ std::string ModeFlagsToString(unsigned int flags, bool identifier)
+   return res;
+ }
+ 
++//! @brief The height a mode is identified by: the per-eye height for a frame-packing mode,
++//!        whose packed frame (1920x2205) is not a resolution anyone would look for.
++int ModeIdentifierHeight(const RESOLUTION_INFO& info)
++{
++  if (info.iBlanking > 0)
++    return (info.iScreenHeight - info.iBlanking) / 2;
++  return info.iScreenHeight;
++}
++
+ // True when this mode is uncalibrated. Only works for live modes; dead or stale modes are
+ // considered non-default always.
+ bool IsDefaultCalibration(const RESOLUTION_INFO& info)
+@@ -662,7 +654,13 @@ DisplayMode CDisplaySettings::GetCurrentDisplayMode() const
+   return DM_FULLSCREEN;
+ }
+ 
+-RESOLUTION CDisplaySettings::FindBestMatchingResolution(const std::map<RESOLUTION, RESOLUTION_INFO> &resolutionInfos, int width, int height, float refreshrate, unsigned flags)
++RESOLUTION CDisplaySettings::FindBestMatchingResolution(
++    const std::map<RESOLUTION, RESOLUTION_INFO>& resolutionInfos,
++    int width,
++    int height,
++    float refreshrate,
++    unsigned flags,
++    bool framePacked /* = false */)
+ {
+   // find the closest match to these in our res vector.  If we have the screen, we score the res
+   RESOLUTION bestRes = RES_DESKTOP;
+@@ -676,8 +674,13 @@ RESOLUTION CDisplaySettings::FindBestMatchingResolution(const std::map<RESOLUTIO
+     if ((info.dwFlags & D3DPRESENTFLAG_MODEMASK) != flags)
+       continue;
+ 
++    // A frame-packing mode carries the top-and-bottom flag too; only iBlanking tells
++    // them apart, and its identifier names the per-eye height, not the packed one.
++    if ((info.iBlanking > 0) != framePacked)
++      continue;
++
+     float score = 10 * (square_error((float)info.iScreenWidth, (float)width) +
+-                  square_error((float)info.iScreenHeight, (float)height) +
++                  square_error((float)ModeIdentifierHeight(info), (float)height) +
+                   square_error(info.fRefreshRate, refreshrate));
+     if (score < bestScore)
+     {
+@@ -716,12 +719,15 @@ RESOLUTION CDisplaySettings::GetResolutionFromString(const std::string &strResol
+     else if(StringUtils::Mid(strResolution, 20,3) == "tab")
+       flags |= D3DPRESENTFLAG_MODE3DTB;
+ 
++    // "ptabfrp": frame packing, the identifier CoreELEC uses for the same mode
++    const bool framePacked = StringUtils::Mid(strResolution, 23, 3) == "frp";
++
+     std::map<RESOLUTION, RESOLUTION_INFO> resolutionInfos;
+     for (size_t resolution = RES_DESKTOP; resolution < CDisplaySettings::GetInstance().ResolutionInfoSize(); resolution++)
+       resolutionInfos.try_emplace(static_cast<RESOLUTION>(resolution),
+                                   CDisplaySettings::GetInstance().GetResolutionInfo(resolution));
+ 
+-    return FindBestMatchingResolution(resolutionInfos, width, height, refresh, flags);
++    return FindBestMatchingResolution(resolutionInfos, width, height, refresh, flags, framePacked);
+   }
+ 
+   return RES_DESKTOP;
+@@ -739,9 +745,11 @@ std::string CDisplaySettings::GetStringFromResolution(RESOLUTION resolution, flo
+     // also handle RES_DESKTOP resolutions with non-default refresh rates
+     if (resolution != RES_DESKTOP || (refreshrate > 0.0f && refreshrate != info.fRefreshRate))
+     {
+-      return StringUtils::Format("{:05}{:05}{:09.5f}{}", info.iScreenWidth, info.iScreenHeight,
++      return StringUtils::Format("{:05}{:05}{:09.5f}{}{}", info.iScreenWidth,
++                                 ModeIdentifierHeight(info),
+                                  refreshrate > 0.0f ? refreshrate : info.fRefreshRate,
+-                                 ModeFlagsToString(info.dwFlags, true));
++                                 ModeFlagsToString(info.dwFlags, true),
++                                 info.iBlanking > 0 ? "frp" : "");
+     }
+   }
+ 
+@@ -761,33 +769,26 @@ void CDisplaySettings::SettingOptionsModesFiller(const std::shared_ptr<const CSe
+                                                  std::vector<StringSettingOption>& list,
+                                                  std::string& current)
+ {
+-  // The whitelist holds the timings playback may switch to, one entry per timing. A
+-  // 3D variant is the same timing transported differently, which stereoscopic
+-  // playback derives from that timing being whitelisted, so offering it here would be
+-  // a choice with no meaning - and one whose packed geometry (1920x2205) reads as a
+-  // resolution the display does not have. videoscreen.resolution still lists the
+-  // layouts, which is where a 3D mode is selected by hand.
+-  const bool omitStereoModes =
+-      IsSettingOrItsListDefinition(setting, CSettings::SETTING_VIDEOSCREEN_WHITELIST);
+-
++  // The 3D variants of a timing are listed alongside it, as CoreELEC does, so a viewer
++  // can whitelist exactly the layouts the display handles (this projector: frame
++  // packing and top-and-bottom at 1080p24, not side-by-side). Whitelisting one licenses
++  // that timing for stereoscopic playback; a frame-packing mode is shown by its per-eye
++  // geometry, since its packed frame (1920x2205) is no resolution the display has.
+   for (auto index = static_cast<unsigned int>(RES_CUSTOM);
+        index < CDisplaySettings::GetInstance().ResolutionInfoSize(); ++index)
+   {
+     const RESOLUTION_INFO& mode = CDisplaySettings::GetInstance().GetResolutionInfo(index);
+ 
+-    if (omitStereoModes &&
+-        (mode.dwFlags & (D3DPRESENTFLAG_MODE3DSBS | D3DPRESENTFLAG_MODE3DTB)) != 0)
+-      continue;
+-
+     if (mode.dwFlags ^ D3DPRESENTFLAG_INTERLACED)
+     {
+       const std::string screenmode =
+           GetStringFromResolution(static_cast<RESOLUTION>(index), mode.fRefreshRate);
+ 
+-      list.emplace_back(
+-          StringUtils::Format("{}x{}{} {:0.2f}Hz", mode.iScreenWidth, mode.iScreenHeight,
+-                              ModeFlagsToString(mode.dwFlags, false), mode.fRefreshRate),
+-          screenmode);
++      list.emplace_back(StringUtils::Format("{}x{}{}{} {:0.2f}Hz", mode.iScreenWidth,
++                                            ModeIdentifierHeight(mode),
++                                            mode.dwFlags & D3DPRESENTFLAG_INTERLACED ? "i" : "p",
++                                            mode.StereoLayoutTag(), mode.fRefreshRate),
++                        screenmode);
+     }
+   }
+ 
+diff --git a/xbmc/settings/DisplaySettings.h b/xbmc/settings/DisplaySettings.h
+index b44629bb68..b983b3ff50 100644
+--- a/xbmc/settings/DisplaySettings.h
++++ b/xbmc/settings/DisplaySettings.h
+@@ -146,7 +146,13 @@ protected:
+   static std::string GetStringFromResolution(RESOLUTION resolution, float refreshrate = 0.0f);
+   static RESOLUTION GetResolutionForScreen();
+ 
+-  static RESOLUTION FindBestMatchingResolution(const std::map<RESOLUTION, RESOLUTION_INFO> &resolutionInfos, int width, int height, float refreshrate, unsigned int flags);
++  static RESOLUTION FindBestMatchingResolution(
++      const std::map<RESOLUTION, RESOLUTION_INFO>& resolutionInfos,
++      int width,
++      int height,
++      float refreshrate,
++      unsigned int flags,
++      bool framePacked = false);
+ 
+ private:
+   // holds the real gui resolution
+-- 
+2.55.0
+

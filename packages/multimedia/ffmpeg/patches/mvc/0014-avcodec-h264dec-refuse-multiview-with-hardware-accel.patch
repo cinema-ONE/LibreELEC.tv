@@ -1,0 +1,52 @@
+From 24b69d0f53e0e5b37eb7d72832eff08703839f61 Mon Sep 17 00:00:00 2001
+From: Dom Cobley <popcornmix@gmail.com>
+Date: Thu, 6 Aug 2026 12:16:18 +0100
+Subject: [PATCH 14/17] avcodec/h264dec: refuse multiview with hardware
+ acceleration
+
+No h264 hwaccel knows about views. They all build the accelerator's
+picture list from short_ref and long_ref and skip pictures whose
+H264Picture.reference is 0 -- see fill_vaapi_ReferenceFrames() and its
+equivalents in the vdpau, dxva2, nvdec and vulkan code.
+
+An inter-view reference is in neither list, and reference == 0 is normal
+for it, because inter_view_flag makes a picture available for inter-view
+prediction independently of whether it is a temporal reference. The
+per-slice reference list is filled from sl->ref_list[] regardless, so a
+dependent view slice would name a surface the accelerator was never
+given.
+
+Decode the base view only and log a warning, rather than submit that.
+
+(cherry picked from commit 3c9691b60c07cf91af7a4b7f79d0e0d0c10f3f7b)
+---
+ libavcodec/h264_slice.c | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/libavcodec/h264_slice.c b/libavcodec/h264_slice.c
+index 7e364000cc..1cf4b72768 100644
+--- a/libavcodec/h264_slice.c
++++ b/libavcodec/h264_slice.c
+@@ -991,6 +991,19 @@ static int setup_multiview(H264Context *h, const SPS *mvc_sps)
+         return AVERROR_BUG;
+     }
+ 
++    /* No hwaccel knows about views. They all build the accelerator's picture
++     * list from short_ref/long_ref, skipping anything with reference == 0, while
++     * an inter-view reference lives in sl->ref_list[] alone and need not be a
++     * temporal reference at all. A dependent view slice would therefore point at
++     * a surface the accelerator was never told about. Decode the base view only
++     * rather than submit that. */
++    if (views_active_output != 1 && h->avctx->hwaccel) {
++        av_log(h->avctx, AV_LOG_WARNING,
++               "Multiview decoding is not supported with hardware acceleration; "
++               "decoding the base view only.\n");
++        return 0;
++    }
++
+     highest_view = av_log2(views_active_output);
+     if (highest_view >= H264_MAX_MVC_VIEWS) {
+         av_log(h->avctx, AV_LOG_ERROR, "Too many views requested: %x\n",
+-- 
+2.55.0
+

@@ -1,0 +1,166 @@
+From 60714ab8c5181d638eb6ad8935e685d1891103ff Mon Sep 17 00:00:00 2001
+From: Dom Cobley <popcornmix@gmail.com>
+Date: Wed, 12 Aug 2026 21:41:09 +0100
+Subject: [PATCH 04/12] DVDDemuxFFmpeg: detect the second view of an H.264 MVC
+ stream
+
+MV-HEVC announces itself in the container, so the multiview machinery could key
+off the AVStereo3D side data the demuxer already exports. H.264 MVC announces
+nothing: the base view SPS is plain High profile, matroska carries no StereoMode
+and no stereo3d side data, and the decoder's view_ids_available list stays empty
+until the subset SPS turns up in band - two packets into the stream on the
+sample tested.
+
+That is too late. Requesting both views has to happen before avcodec_open2(),
+because it also decides whether a hwaccel may attach, and no hwaccel decodes the
+dependent layer. Waiting for the decoder to notice would mean either giving up
+hardware decoding for every H.264 stream, which is not a trade worth making on a
+Pi, or reopening the codec mid-stream.
+
+There is a container level signal, just not one ffmpeg surfaces: the MVC
+configuration is appended to the base avcC as an ISO 14496-15 mvcC box holding
+the subset SPS. Find it by box type and validate the size that precedes it,
+rather than walking the avcC, whose trailing high profile fields are optional
+and leave its end ambiguous. Both Blu-ray rips tested carry a well formed box
+declaring Stereo High.
+
+The stream is only marked multiview when the decoder can decode the second
+view, which is whether its option table carries view_ids - a runtime check,
+because H.264 gained the option well after HEVC and a version cannot separate
+the two. Marking it regardless would cost the stream its hardware decoder,
+since multiview forces software decoding before the option can be refused, and
+get nothing back: an ffmpeg without H.264 MVC support therefore keeps hardware
+decoding the base view exactly as it does today, and the stream stays 2D. The
+refusal path in the decoders remains as the backstop.
+
+The base view is the left eye. Nothing in these streams says otherwise - the
+tested samples export no view_pos_available - but the decoder already corrects
+the reported mode when a bitstream does say which view is which.
+
+Everything after detection is the machinery MV-HEVC needed: the h264 decoder
+takes the same view_ids option, exports the same view_ids_available, and tags
+frames with the same AV_FRAME_DATA_VIEW_ID, so the views are packed by the same
+filter graph. One difference is worth noting: the frame before the subset SPS
+appears has no view id at all, and it is the defensive path that feeds such a
+frame to both graph inputs which keeps that first frame from stalling the graph
+or offsetting the pairing for the rest of the stream.
+
+Verified on a Pi 4 against a Blu-ray MVC rip: the box is found and both views
+are decoded and packed.
+
+(cherry picked from commit f2ad7e7cf3fc9a2244ab6a9e6b29a3834705b213)
+---
+ .../DVDDemuxers/DVDDemuxFFmpeg.cpp            | 64 +++++++++++++++++++
+ .../VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h  |  7 ++
+ 2 files changed, 71 insertions(+)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
+index 024dff808e..1437f819ad 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
+@@ -1965,6 +1965,28 @@ CDemuxStream* CDVDDemuxFFmpeg::AddStream(int streamIdx)
+         // check for metadata in file if detection in stream failed
+         if (stereoMode.empty())
+           stereoMode = GetStereoModeFromMetadata(m_pFormatContext->metadata);
++        // H.264 MVC keeps its second view in the codec extradata, and nothing a
++        // container exposes as stereo metadata describes it. What a matroska rip
++        // does carry is StereoMode "both eyes laced in one block", which ffmpeg
++        // reports as frame alternate: that says how the views are coded, not that
++        // they are packed into a frame a renderer could crop an eye from, and Kodi
++        // has no way to present it. So let the mvcC box override it rather than be
++        // hidden by it - a block layout is the one case where the container's
++        // description and the decoder's output are about different things.
++        // The base view is the left eye unless the block order says otherwise;
++        // either way the decoder corrects the mode if the bitstream says which
++        // view is which.
++        // Only claim the second view when the decoder can actually produce it.
++        // Flagging it regardless would cost the stream its hardware decoder -
++        // multiview forces software decoding before the option can be refused -
++        // and get nothing back, so an ffmpeg without H.264 MVC support keeps
++        // hardware decoding the base view exactly as it does today.
++        if ((stereoMode.empty() || stereoMode == "block_lr" || stereoMode == "block_rl") &&
++            HasMvcExtension(pStream) && SupportsMultiviewDecode(pStream->codecpar->codec_id))
++        {
++          stereoMode = stereoMode == "block_rl" ? "right_left" : "left_right";
++          multiview = true;
++        }
+         if (!stereoMode.empty())
+         {
+           st->stereo_mode = stereoMode;
+@@ -2557,6 +2579,48 @@ std::string CDVDDemuxFFmpeg::GetStereoModeFromSideData(const AVStream* pStream,
+   }
+ }
+ 
++bool CDVDDemuxFFmpeg::SupportsMultiviewDecode(AVCodecID codecId)
++{
++  const AVCodec* codec = avcodec_find_decoder(codecId);
++  if (!codec || !codec->priv_class)
++    return false;
++
++  // The multiview machinery hangs off the decoder's view_ids option, so whether
++  // it is in the option table is whether the dependent view can be decoded.
++  // H.264 gained it well after HEVC, so this cannot be a version check.
++  const AVClass* avClass = codec->priv_class;
++  return av_opt_find(&avClass, "view_ids", nullptr, 0, AV_OPT_SEARCH_FAKE_OBJ) != nullptr;
++}
++
++bool CDVDDemuxFFmpeg::HasMvcExtension(const AVStream* pStream)
++{
++  if (pStream->codecpar->codec_id != AV_CODEC_ID_H264)
++    return false;
++
++  const uint8_t* data = pStream->codecpar->extradata;
++  const int size = pStream->codecpar->extradata_size;
++  if (!data || size < 12 || data[0] != 1)
++    return false;
++
++  // H.264 MVC carries the second view's configuration in an ISO 14496-15 mvcC
++  // box appended to the base avcC. Look for the box by type and check the size
++  // that precedes it rather than walking the avcC, whose trailing high profile
++  // fields are optional and would make the end of it ambiguous.
++  for (int i = 4; i + 4 <= size; ++i)
++  {
++    if (memcmp(data + i, "mvcC", 4) != 0)
++      continue;
++
++    const uint32_t boxSize =
++        (static_cast<uint32_t>(data[i - 4]) << 24) | (static_cast<uint32_t>(data[i - 3]) << 16) |
++        (static_cast<uint32_t>(data[i - 2]) << 8) | static_cast<uint32_t>(data[i - 1]);
++    if (boxSize >= 8 && static_cast<uint64_t>(i - 4) + boxSize <= static_cast<uint64_t>(size))
++      return true;
++  }
++
++  return false;
++}
++
+ std::string CDVDDemuxFFmpeg::ConvertCodecToInternalStereoMode(const std::string &mode, const StereoModeConversionMap* conversionMap)
+ {
+   size_t i = 0;
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
+index 4f535d1fdb..ccfcbbec99 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
+@@ -114,6 +114,12 @@ public:
+ 
+   bool Aborted();
+ 
++  /*!
++   * \brief Whether the decoder for this codec can decode and output every view
++   *        of a multiview stream, i.e. carries the view_ids option.
++   */
++  static bool SupportsMultiviewDecode(AVCodecID codecId);
++
+   AVFormatContext* m_pFormatContext;
+   std::shared_ptr<CDVDInputStream> m_pInput;
+ 
+@@ -141,6 +147,7 @@ protected:
+ 
+   std::string GetStereoModeFromMetadata(AVDictionary* pMetadata);
+   std::string GetStereoModeFromSideData(const AVStream* pStream, bool& multiview);
++  bool HasMvcExtension(const AVStream* pStream);
+   std::string ConvertCodecToInternalStereoMode(const std::string& mode, const StereoModeConversionMap* conversionMap);
+ 
+   void GetL16Parameters(int& channels, int& samplerate);
+-- 
+2.55.0
+

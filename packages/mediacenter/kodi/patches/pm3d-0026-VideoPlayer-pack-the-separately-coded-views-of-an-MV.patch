@@ -1,0 +1,532 @@
+From c063a744e6434d845fb91b52c108db60fbe74cfb Mon Sep 17 00:00:00 2001
+From: Dom Cobley <popcornmix@gmail.com>
+Date: Sat, 1 Aug 2026 12:28:05 +0100
+Subject: [PATCH 02/12] VideoPlayer: pack the separately coded views of an
+ MV-HEVC stream side by side
+
+Apple "spatial video" and other MV-HEVC files code the two eyes as two layers
+of one HEVC bitstream rather than packing them into one frame. ffmpeg decodes
+both from 7.1 onwards, but only when asked, and it hands them back as separate
+frames sharing a pts. Kodi has no representation for that - every renderer
+expects one frame holding both eyes - so such a file played as a flat 2D clip
+of the base view.
+
+It does already handle a full side by side frame correctly, cropping an eye in
+CBaseRenderer::ManageRenderArea() and undoing the doubled aspect in
+GetPerEyeAspectRatio(). So rather than teach the renderers about separate
+views, pack the views in the decoder and hand the renderers what they already
+understand.
+
+The demuxer flags such a stream, which is the AVStereo3D unspecified type with
+both views present, and reports the mode the decoder is going to produce. That
+tag is what selects a 3D display mode before the first frame is decoded, so it
+has to describe the packed frame, not the coded layout. The new multiview flag
+travels beside it so the decoder knows the packing is still owed.
+
+Both decoders then set the hevc view_ids option to decode every view, and gain
+a second buffer source feeding hstack ahead of whatever the chain already held.
+hstack is framesync based and pairs frames by pts, which is exactly what the
+decoder gives the two views of an access unit, so a dropped or missing view
+reuses the previous one for that timestamp rather than swapping the eyes for
+the rest of the stream. Frames are routed to a source by AV_FRAME_DATA_VIEW_ID,
+with the first view seen taking the left half; if the bitstream says that view
+is the right eye the reported mode becomes right_left rather than the graph
+being rewired.
+
+No hardware accelerator decodes the dependent layer, so multiview has to force
+software decoding in both paths. A hwaccel is not a decoder in its own right -
+the ordinary decoder offers it as an extra pixel format - so turning one down
+means turning down that format in get_format(), which is where
+DVDVideoCodecDRMPRIME now does it, having also not created a hardware device
+context for one to attach to. Left to itself it picked drm_prime on a Pi and
+handed hstack frames whose contents live on the GPU, which wedged playback.
+DVDVideoCodecFFmpeg declines to attach an IHardwareDecoder for the same reason,
+which would otherwise skip the filter graph entirely.
+
+Threading has to change with it. Frame threading overlaps consecutive frames,
+which multiview coding does not allow: the dependent view of an access unit
+predicts from the base view of that same access unit, so the two are strictly
+ordered and the extra threads contribute nothing but synchronisation. Measured on
+an H.264 MVC stream, four frame threads decode 47 access units per second against
+62 for a single thread - slower than not threading at all, while the base view
+alone scales from 101 to 220. Ask for slice threading instead, which parallelises
+within a picture and is unaffected by the inter-view dependency.
+DVDVideoCodecFFmpeg also needs a thread count, since a multiview stream never
+reaches a hardware accelerator and would otherwise be left on the single thread
+the hardware path assumes.
+
+On a Pi 4 playing a 1080p23.98 Blu-ray MVC rip that is the difference between
+unwatchable and correct. Before, the decoder produced frames at half rate, one
+core of four busy, video falling steadily behind audio - presenting 73 frames
+late with the late frame count climbing past 7000 in seconds, and the player
+periodically seeking to catch up. After, two cores are busy, the late frame count
+sits at 11 and does not grow over a 75 second run, and nothing resyncs.
+
+Filter output on the DRMPRIME path is still allocated through GetBuffer(), so
+the packed frame lands in a DMA buffer and direct to plane scanout is
+unaffected. That needs a second buffer pool: a pool serves exactly the one size
+it was configured with, and the packed frame is twice as wide as the decoder's
+own frames, so the request fell through to the only registered pool factory and
+came back as system memory that GetBuffer() could not use. Register another dma
+pool on that miss - an unconfigured one takes the size of the first request it
+sees - and release the buffer that came from the wrong pool rather than leaking
+it. The graph is kept up for the whole stream, since it is now load bearing
+rather than an optional deinterlace, and if it cannot be built the stream is
+downgraded to mono so the base view plays as 2D rather than the renderer
+cropping half of a single view.
+
+Kodi accepts a system ffmpeg from 7.0, where none of view_ids,
+AV_STEREO3D_UNSPEC or AV_FRAME_DATA_VIEW_ID exist, so the multiview paths are
+guarded on 7.1. If the option is rejected at runtime the stream is reported as
+mono for the same reason.
+
+Verified with a 1920x1080 30fps MV-HEVC sample, on the software path and on a
+Pi 4 through DVDVideoCodecDRMPRIME: the demuxer reports the stereo metadata,
+the graph configures as two 1920x1080 sources into hstack out to 3840x1080, the
+decoder pairs view 0 as the left eye, dma buffers are allocated at both sizes,
+and RenderManager is configured for 3840x1080 at 30fps.
+
+(cherry picked from commit 4a3dd973ff11c87d2c198d07883eb3caf2773eec)
+---
+ xbmc/cores/FFmpeg.h                           |   5 +
+ .../DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp   | 167 +++++++++++++++++-
+ .../DVDCodecs/Video/DVDVideoCodecFFmpeg.h     |   7 +
+ xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemux.h |   1 +
+ .../DVDDemuxers/DVDDemuxFFmpeg.cpp            |  22 ++-
+ .../VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h  |   2 +-
+ xbmc/cores/VideoPlayer/DVDStreamInfo.cpp      |   6 +-
+ xbmc/cores/VideoPlayer/DVDStreamInfo.h        |   1 +
+ 8 files changed, 201 insertions(+), 10 deletions(-)
+
+diff --git a/xbmc/cores/FFmpeg.h b/xbmc/cores/FFmpeg.h
+index 1cce966448..dc7b97ccd5 100644
+--- a/xbmc/cores/FFmpeg.h
++++ b/xbmc/cores/FFmpeg.h
+@@ -22,6 +22,11 @@ extern "C"
+ 
+ #include <tuple>
+ 
++// Multiview (MV-HEVC "spatial video") needs the hevc decoder's view_ids option,
++// AV_STEREO3D_UNSPEC and AV_FRAME_DATA_VIEW_ID, all of which landed in FFmpeg
++// 7.1, while a system ffmpeg is still accepted from 7.0.
++#define FFMPEG_HAVE_MULTIVIEW (LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(59, 38, 100))
++
+ namespace FFMPEG_HELP_TOOLS
+ {
+ 
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+index c1f82260ed..4353011b8a 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+@@ -38,6 +38,7 @@ extern "C" {
+ #include <libavutil/mastering_display_metadata.h>
+ #include <libavutil/opt.h>
+ #include <libavutil/pixdesc.h>
++#include <libavutil/stereo3d.h>
+ #include <libavutil/video_enc_params.h>
+ }
+ 
+@@ -261,7 +262,10 @@ enum AVPixelFormat CDVDVideoCodecFFmpeg::GetFormat(struct AVCodecContext * avctx
+   // 2nd condition:
+   // fix an ffmpeg issue here, it calls us with an invalid profile
+   // then a 2nd call with a valid one
+-  if (ctx->m_decoderState != STATE_HW_SINGLE ||
++  // 3rd condition:
++  // no hw accel decodes the dependent layer of a multiview stream, and the
++  // filter graph that packs the views is skipped entirely when one is attached
++  if (ctx->m_decoderState != STATE_HW_SINGLE || ctx->m_multiview ||
+       (avctx->codec_id == AV_CODEC_ID_VC1 && avctx->profile == AV_PROFILE_UNKNOWN))
+   {
+     AVPixelFormat defaultFmt = avcodec_default_get_format(avctx, fmt);
+@@ -434,6 +438,44 @@ bool CDVDVideoCodecFFmpeg::Open(CDVDStreamInfo &hints, CDVDCodecOptions &options
+     av_opt_set(m_pCodecContext, it->m_name.c_str(), it->m_value.c_str(), 0);
+   }
+ 
++  m_multiview = false;
++  m_baseViewId = -1;
++  m_stereoMode.clear();
++  if (hints.multiview)
++  {
++    // Ask for every coded view rather than just the base layer. The views come
++    // out as separate frames sharing one pts; the filter graph packs them side
++    // by side into the layout the demuxer already advertised.
++    if (av_opt_set(m_pCodecContext, "view_ids", "-1", AV_OPT_SEARCH_CHILDREN) < 0)
++    {
++      CLog::Log(LOGWARNING,
++                "CDVDVideoCodecFFmpeg::{} - decoder has no multiview support, playing the base "
++                "view only",
++                __FUNCTION__);
++      // The demuxer advertised the packed layout this decoder was expected to
++      // produce. It is not going to, so say so rather than let the renderer
++      // crop half of a single view.
++      m_stereoMode = "mono";
++    }
++    else
++    {
++      m_multiview = true;
++      m_stereoMode = hints.stereo_mode;
++
++      // A multiview stream never reaches a hardware accelerator, so it would
++      // otherwise decode on the single thread the hardware path leaves it with.
++      // Thread it, but by slice only: frame threading overlaps consecutive
++      // frames, which multiview coding does not allow, because the dependent
++      // view of an access unit predicts from the base view of that same access
++      // unit. Measured on an H.264 MVC stream frame threading is about a
++      // quarter slower than slice threading alone. A stream this decoder plays
++      // as 2D keeps the threading it has today.
++      m_pCodecContext->thread_count =
++          std::max(1, std::min(CServiceBroker::GetCPUInfo()->GetCPUCount(), 16));
++      m_pCodecContext->thread_type = FF_THREAD_SLICE;
++    }
++  }
++
+   if (avcodec_open2(m_pCodecContext, pCodec, nullptr) < 0)
+   {
+     CLog::Log(LOGDEBUG,"CDVDVideoCodecFFmpeg::Open() Unable to open codec");
+@@ -896,8 +938,13 @@ CDVDVideoCodec::VCReturn CDVDVideoCodecFFmpeg::GetPicture(VideoPicture* pVideoPi
+         need_reopen = true;
+     }
+ 
++    // the multiview graph packs the two views together, so it has to stay up
++    // for the whole stream even when no other filtering is wanted
++    if (m_multiview && m_filterEof)
++      need_reopen = true;
++
+     // try to setup new filters
+-    if (need_reopen || (need_scale && m_pFilterGraph == nullptr))
++    if (need_reopen || ((need_scale || m_multiview) && m_pFilterGraph == nullptr))
+     {
+       m_filters = m_filters_next;
+ 
+@@ -969,6 +1016,7 @@ void CDVDVideoCodecFFmpeg::Reset()
+     m_pHardware->Reset();
+ 
+   m_filters = "";
++  m_baseViewId = -1;
+   FilterClose();
+   m_dropCtrl.Reset(false);
+ }
+@@ -1045,6 +1093,10 @@ bool CDVDVideoCodecFFmpeg::GetPictureCommon(VideoPicture* pVideoPicture)
+   {
+     pVideoPicture->stereoMode = (const char*)entry->value;
+   }
++  // a stream whose views the decoder packs itself carries no such tag - the
++  // mode is the one the packing produced
++  else if (!m_stereoMode.empty())
++    pVideoPicture->stereoMode = m_stereoMode;
+   else
+     pVideoPicture->stereoMode.clear();
+ 
+@@ -1235,7 +1287,7 @@ int CDVDVideoCodecFFmpeg::FilterOpen(const std::string& filters, bool scale)
+   if (m_pFilterGraph)
+     FilterClose();
+ 
+-  if (filters.empty() && !scale)
++  if (filters.empty() && !scale && !m_multiview)
+     return 0;
+ 
+   if (m_pHardware)
+@@ -1293,7 +1345,20 @@ int CDVDVideoCodecFFmpeg::FilterOpen(const std::string& filters, bool scale)
+     return result;
+   }
+ 
+-  if (!filters.empty())
++  // The second view arrives on its own source with the same parameters. hstack
++  // pairs the two by pts, which is what the decoder gives both views of an
++  // access unit, so the eyes cannot drift apart.
++  if (m_multiview)
++  {
++    if ((result = avfilter_graph_create_filter(&m_pFilterIn2, srcFilter, "src2", args.c_str(), NULL,
++                                               m_pFilterGraph)) < 0)
++    {
++      CLog::Log(LOGERROR, "CDVDVideoCodecFFmpeg::FilterOpen - avfilter_graph_create_filter: src2");
++      return result;
++    }
++  }
++
++  if (!filters.empty() || m_multiview)
+   {
+     AVFilterInOut* outputs = avfilter_inout_alloc();
+     AVFilterInOut* inputs  = avfilter_inout_alloc();
+@@ -1308,7 +1373,22 @@ int CDVDVideoCodecFFmpeg::FilterOpen(const std::string& filters, bool scale)
+     inputs->pad_idx = 0;
+     inputs->next = nullptr;
+ 
+-    result = avfilter_graph_parse_ptr(m_pFilterGraph, m_filters.c_str(), &inputs, &outputs, NULL);
++    std::string graphDesc = filters;
++    if (m_multiview)
++    {
++      AVFilterInOut* outputs2 = avfilter_inout_alloc();
++      outputs2->name = av_strdup("in2");
++      outputs2->filter_ctx = m_pFilterIn2;
++      outputs2->pad_idx = 0;
++      outputs2->next = nullptr;
++      outputs->next = outputs2;
++
++      graphDesc = "[in][in2]hstack=inputs=2";
++      if (!filters.empty())
++        graphDesc += "," + filters;
++    }
++
++    result = avfilter_graph_parse_ptr(m_pFilterGraph, graphDesc.c_str(), &inputs, &outputs, NULL);
+     avfilter_inout_free(&outputs);
+     avfilter_inout_free(&inputs);
+ 
+@@ -1367,17 +1447,92 @@ void CDVDVideoCodecFFmpeg::FilterClose()
+ 
+     // Disposed by above code
+     m_pFilterIn = nullptr;
++    m_pFilterIn2 = nullptr;
+     m_pFilterOut = nullptr;
+   }
+ }
+ 
++AVFilterContext* CDVDVideoCodecFFmpeg::SelectViewInput(AVFrame* frame)
++{
++#if !FFMPEG_HAVE_MULTIVIEW
++  return m_pFilterIn;
++#else
++  const AVFrameSideData* sd = av_frame_get_side_data(frame, AV_FRAME_DATA_VIEW_ID);
++  if (!sd || sd->size < sizeof(int))
++  {
++    // Not a multiview access unit after all. hstack waits for a frame on both
++    // of its inputs, so feed it this one twice rather than stall the graph.
++    AVFrame* copy = av_frame_clone(frame);
++    if (copy)
++    {
++      if (av_buffersrc_add_frame(m_pFilterIn2, copy) < 0)
++        CLog::Log(LOGERROR, "CDVDVideoCodecFFmpeg::{} - unable to fill the second view",
++                  __FUNCTION__);
++      av_frame_free(&copy);
++    }
++    return m_pFilterIn;
++  }
++
++  const int viewId = *reinterpret_cast<const int*>(sd->data);
++
++  if (m_baseViewId < 0)
++  {
++    m_baseViewId = viewId;
++
++    // The first view out of the decoder goes in the left half. If the bitstream
++    // says that view is the right eye, tell the renderer the halves are swapped
++    // rather than reorder the graph inputs.
++    const AVFrameSideData* stereo = av_frame_get_side_data(frame, AV_FRAME_DATA_STEREO3D);
++    if (stereo && stereo->size >= sizeof(AVStereo3D))
++    {
++      switch (reinterpret_cast<const AVStereo3D*>(stereo->data)->view)
++      {
++        case AV_STEREO3D_VIEW_LEFT:
++          m_stereoMode = "left_right";
++          break;
++        case AV_STEREO3D_VIEW_RIGHT:
++          m_stereoMode = "right_left";
++          break;
++        default:
++          break;
++      }
++    }
++
++    CLog::Log(LOGDEBUG, "CDVDVideoCodecFFmpeg::{} - multiview base view {}, stereo mode {}",
++              __FUNCTION__, viewId, m_stereoMode);
++  }
++
++  return viewId == m_baseViewId ? m_pFilterIn : m_pFilterIn2;
++#endif
++}
++
+ CDVDVideoCodec::VCReturn CDVDVideoCodecFFmpeg::FilterProcess(AVFrame* frame)
+ {
+   int result;
+ 
+   if (frame || (m_codecControlFlags & DVD_CODEC_CTRL_DRAIN))
+   {
+-    result = av_buffersrc_add_frame(m_pFilterIn, frame);
++    AVFilterContext* src = m_pFilterIn;
++    if (m_pFilterIn2)
++    {
++      if (frame)
++      {
++        src = SelectViewInput(frame);
++      }
++      else
++      {
++        // Draining: both sources have to see the end of stream or the sink
++        // never reports EOF.
++        result = av_buffersrc_add_frame(m_pFilterIn2, nullptr);
++        if (result < 0)
++        {
++          CLog::Log(LOGERROR, "CDVDVideoCodecFFmpeg::FilterProcess - av_buffersrc_add_frame src2");
++          return VC_ERROR;
++        }
++      }
++    }
++
++    result = av_buffersrc_add_frame(src, frame);
+     if (result < 0)
+     {
+       CLog::Log(LOGERROR, "CDVDVideoCodecFFmpeg::FilterProcess - av_buffersrc_add_frame");
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.h
+index 139de8a0af..1a379be801 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.h
+@@ -54,6 +54,7 @@ protected:
+ 
+   int  FilterOpen(const std::string& filters, bool scale);
+   void FilterClose();
++  AVFilterContext* SelectViewInput(AVFrame* frame);
+   CDVDVideoCodec::VCReturn FilterProcess(AVFrame* frame);
+   void SetFilters();
+   void UpdateName();
+@@ -71,11 +72,17 @@ protected:
+   std::string m_filters_next;
+   AVFilterGraph* m_pFilterGraph = nullptr;
+   AVFilterContext* m_pFilterIn = nullptr;
++  AVFilterContext* m_pFilterIn2 = nullptr; //!< second view of a multiview stream
+   AVFilterContext* m_pFilterOut = nullptr;;
+   AVFrame* m_pFilterFrame = nullptr;;
+   bool m_filterEof = false;
+   bool m_eof = false;
+ 
++  //! Eyes are coded as separate views and are packed side by side by the filter graph.
++  bool m_multiview = false;
++  int m_baseViewId = -1; //!< view id of the view that goes in the left half
++  std::string m_stereoMode; //!< mode the packed frame is in, empty when not stereoscopic
++
+   std::unique_ptr<IDVDVideoPP> m_postProc;
+ 
+   int m_iPictureWidth = 0;
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemux.h b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemux.h
+index 96ba1c15e3..9fd1743242 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemux.h
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemux.h
+@@ -177,6 +177,7 @@ public:
+   std::shared_ptr<AVContentLightMetadata> contentLightMetaData;
+ 
+   std::string stereo_mode; // expected stereo mode
++  bool multiview = false; // eyes are coded as separate views and must be packed by the decoder
+   StreamHdrType hdr_type = StreamHdrType::HDR_TYPE_NONE; // type of HDR for this stream (hdr10, etc)
+   AVDOVIDecoderConfigurationRecord dovi{};
+ };
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
+index c1a06c98aa..b84c6abeeb 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
+@@ -1811,7 +1811,8 @@ CDemuxStream* CDVDDemuxFFmpeg::AddStream(int streamIdx)
+         }
+ 
+         // detect stereoscopic mode
+-        std::string stereoMode = GetStereoModeFromSideData(pStream);
++        bool multiview = false;
++        std::string stereoMode = GetStereoModeFromSideData(pStream, multiview);
+         // fall back to the container metadata tags (matroska, asf/wmv)
+         if (stereoMode.empty())
+           stereoMode = GetStereoModeFromMetadata(pStream->metadata);
+@@ -1819,7 +1820,10 @@ CDemuxStream* CDVDDemuxFFmpeg::AddStream(int streamIdx)
+         if (stereoMode.empty())
+           stereoMode = GetStereoModeFromMetadata(m_pFormatContext->metadata);
+         if (!stereoMode.empty())
++        {
+           st->stereo_mode = stereoMode;
++          st->multiview = multiview;
++        }
+ 
+         if (m_pInput->IsStreamType(DVDSTREAM_TYPE_DVD))
+         {
+@@ -2361,8 +2365,10 @@ std::string CDVDDemuxFFmpeg::GetStereoModeFromMetadata(AVDictionary* pMetadata)
+   return stereoMode;
+ }
+ 
+-std::string CDVDDemuxFFmpeg::GetStereoModeFromSideData(const AVStream* pStream)
++std::string CDVDDemuxFFmpeg::GetStereoModeFromSideData(const AVStream* pStream, bool& multiview)
+ {
++  multiview = false;
++
+   const AVPacketSideData* sideData =
+       av_packet_side_data_get(pStream->codecpar->coded_side_data,
+                               pStream->codecpar->nb_coded_side_data, AV_PKT_DATA_STEREO3D);
+@@ -2388,6 +2394,18 @@ std::string CDVDDemuxFFmpeg::GetStereoModeFromSideData(const AVStream* pStream)
+       return inverted ? "col_interleaved_rl" : "col_interleaved_lr";
+     case AV_STEREO3D_FRAMESEQUENCE:
+       return inverted ? "block_rl" : "block_lr";
++#if FFMPEG_HAVE_MULTIVIEW
++    case AV_STEREO3D_UNSPEC:
++      // MV-HEVC "spatial video" and the like: the eyes are coded as separate
++      // views rather than packed into one frame. The decoder packs them side by
++      // side, so report the mode it is going to produce and flag that it still
++      // has that work to do. The decoder refines the eye order if the bitstream
++      // says which view is which.
++      if (stereo->view != AV_STEREO3D_VIEW_PACKED)
++        return "";
++      multiview = true;
++      return inverted ? "right_left" : "left_right";
++#endif
+     default:
+       return "";
+   }
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
+index 27fcff5a51..02fdd8fe46 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
+@@ -137,7 +137,7 @@ protected:
+   unsigned int HLSSelectProgram();
+ 
+   std::string GetStereoModeFromMetadata(AVDictionary* pMetadata);
+-  std::string GetStereoModeFromSideData(const AVStream* pStream);
++  std::string GetStereoModeFromSideData(const AVStream* pStream, bool& multiview);
+   std::string ConvertCodecToInternalStereoMode(const std::string& mode, const StereoModeConversionMap* conversionMap);
+ 
+   void GetL16Parameters(int& channels, int& samplerate);
+diff --git a/xbmc/cores/VideoPlayer/DVDStreamInfo.cpp b/xbmc/cores/VideoPlayer/DVDStreamInfo.cpp
+index 3cc705ba6e..6190f05caf 100644
+--- a/xbmc/cores/VideoPlayer/DVDStreamInfo.cpp
++++ b/xbmc/cores/VideoPlayer/DVDStreamInfo.cpp
+@@ -68,6 +68,7 @@ void CDVDStreamInfo::Clear()
+   masteringMetadata = nullptr;
+   contentLightMetadata = nullptr;
+   stereo_mode.clear();
++  multiview = false;
+   dovi = {};
+ 
+   channels   = 0;
+@@ -114,7 +115,8 @@ bool CDVDStreamInfo::Equal(const CDVDStreamInfo& right, int compare)
+   || colorRange != right.colorRange
+   || colorPrimaries != right.colorPrimaries
+   || colorTransferCharacteristic != right.colorTransferCharacteristic
+-  || stereo_mode != right.stereo_mode)
++  || stereo_mode != right.stereo_mode
++  || multiview != right.multiview)
+     return false;
+   // clang-format on
+ 
+@@ -236,6 +238,7 @@ void CDVDStreamInfo::Assign(const CDVDStreamInfo& right, bool withextradata)
+   masteringMetadata = right.masteringMetadata;
+   contentLightMetadata = right.contentLightMetadata;
+   stereo_mode = right.stereo_mode;
++  multiview = right.multiview;
+   dovi = right.dovi;
+ 
+   // AUDIO
+@@ -304,6 +307,7 @@ void CDVDStreamInfo::Assign(const CDemuxStream& right, bool withextradata)
+     masteringMetadata = stream->masteringMetaData;
+     contentLightMetadata = stream->contentLightMetaData;
+     stereo_mode = stream->stereo_mode;
++    multiview = stream->multiview;
+     dovi = stream->dovi;
+   }
+   else if (right.type == StreamType::SUBTITLE)
+diff --git a/xbmc/cores/VideoPlayer/DVDStreamInfo.h b/xbmc/cores/VideoPlayer/DVDStreamInfo.h
+index 1da58a7e6a..6cee4842cd 100644
+--- a/xbmc/cores/VideoPlayer/DVDStreamInfo.h
++++ b/xbmc/cores/VideoPlayer/DVDStreamInfo.h
+@@ -79,6 +79,7 @@ public:
+   std::shared_ptr<AVMasteringDisplayMetadata> masteringMetadata;
+   std::shared_ptr<AVContentLightMetadata> contentLightMetadata;
+   std::string stereo_mode; // stereoscopic 3d mode
++  bool multiview; // eyes are coded as separate views and must be packed by the decoder
+   AVDOVIDecoderConfigurationRecord dovi{};
+ 
+   // AUDIO
+-- 
+2.55.0
+

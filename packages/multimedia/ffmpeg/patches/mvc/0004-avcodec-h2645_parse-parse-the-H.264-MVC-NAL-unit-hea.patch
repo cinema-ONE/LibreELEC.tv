@@ -1,0 +1,99 @@
+From 3a8b558b7da96609bd2db20cca8fc796df055ffc Mon Sep 17 00:00:00 2001
+From: Dom Cobley <popcornmix@gmail.com>
+Date: Fri, 31 Jul 2026 19:27:55 +0100
+Subject: [PATCH 04/17] avcodec/h2645_parse: parse the H.264 MVC NAL unit
+ header extension
+
+NAL types 14 (prefix), 20 (coded slice extension) and 21 (depth coded slice
+extension) carry a three byte nal_unit_header_mvc_extension() (H.7.3.1.1) ahead
+of their payload. Parse it here so that view_id and the anchor/inter-view flags
+are available alongside the rest of the NAL header, and so that nal->gb is left
+positioned at the payload proper -- for a coded slice extension that is
+slice_header(), which means the existing slice header parser can be reused
+unchanged.
+
+The SVC variant of the extension is the same size, so consume and ignore it
+rather than misparsing the payload that follows.
+
+(cherry picked from commit 133852b59833859d9cbfe8425a811b2620173480)
+---
+ libavcodec/h2645_parse.c | 38 ++++++++++++++++++++++++++++++++++++++
+ libavcodec/h2645_parse.h | 13 +++++++++++++
+ 2 files changed, 51 insertions(+)
+
+diff --git a/libavcodec/h2645_parse.c b/libavcodec/h2645_parse.c
+index 3c2b3aa889..6420d621e7 100644
+--- a/libavcodec/h2645_parse.c
++++ b/libavcodec/h2645_parse.c
+@@ -455,6 +455,44 @@ static int h264_parse_nal_header(H2645NAL *nal, void *logctx)
+     nal->ref_idc = get_bits(gb, 2);
+     nal->type    = get_bits(gb, 5);
+ 
++    /* NALs are reused between packets, so these must always be initialised. */
++    nal->view_id         = -1;
++    nal->anchor_pic_flag = 0;
++    nal->inter_view_flag = 0;
++    nal->non_idr_flag    = 0;
++
++    if (nal->type == H264_NAL_PREFIX || nal->type == H264_NAL_EXTEN_SLICE ||
++        nal->type == H264_NAL_DEPTH_EXTEN_SLICE) {
++        /* nal_unit_header_svc_extension() and nal_unit_header_mvc_extension()
++         * are both three bytes wide, including the svc_extension_flag. Consuming
++         * them here leaves nal->gb at the start of the payload proper, i.e. at
++         * slice_header() for a coded slice extension. */
++        if (get_bits_left(gb) < 24)
++            return AVERROR_INVALIDDATA;
++
++        if (get_bits1(gb)) {            // svc_extension_flag
++            /* SVC (Annex G) is not supported; skip the header so that the NAL is
++             * merely ignored rather than misparsed. */
++            skip_bits(gb, 23);
++        } else {
++            nal->non_idr_flag    = get_bits1(gb);
++            skip_bits(gb, 6);           // priority_id
++            nal->view_id         = get_bits(gb, 10);
++            nal->temporal_id     = get_bits(gb, 3);
++            nal->anchor_pic_flag = get_bits1(gb);
++            nal->inter_view_flag = get_bits1(gb);
++            skip_bits1(gb);             // reserved_one_bit
++
++            av_log(logctx, AV_LOG_DEBUG,
++                   "nal_unit_type: %d(%s), nal_ref_idc: %d, view_id: %d, "
++                   "temporal_id: %d, anchor: %d, inter_view: %d\n",
++                   nal->type, h264_nal_unit_name(nal->type), nal->ref_idc,
++                   nal->view_id, nal->temporal_id, nal->anchor_pic_flag,
++                   nal->inter_view_flag);
++            return 0;
++        }
++    }
++
+     av_log(logctx, AV_LOG_DEBUG,
+            "nal_unit_type: %d(%s), nal_ref_idc: %d\n",
+            nal->type, h264_nal_unit_name(nal->type), nal->ref_idc);
+diff --git a/libavcodec/h2645_parse.h b/libavcodec/h2645_parse.h
+index 0e1e950294..1cc2e079ed 100644
+--- a/libavcodec/h2645_parse.h
++++ b/libavcodec/h2645_parse.h
+@@ -66,6 +66,19 @@ typedef struct H2645NAL {
+      */
+     int nuh_layer_id;
+ 
++    /**
++     * H.264 MVC only, from nal_unit_header_mvc_extension() (H.7.3.1.1), which is
++     * present on NAL types 14, 20 and 21 only.
++     *
++     * view_id is -1 when this NAL has no MVC extension header, either because
++     * its type does not carry one or because it carries an SVC one instead; the
++     * other fields are then meaningless.
++     */
++    int view_id;
++    uint8_t anchor_pic_flag;
++    uint8_t inter_view_flag;
++    uint8_t non_idr_flag;
++
+     int skipped_bytes;
+     int skipped_bytes_pos_size;
+     int *skipped_bytes_pos;
+-- 
+2.55.0
+

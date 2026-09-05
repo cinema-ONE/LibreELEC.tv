@@ -1,0 +1,262 @@
+From 7fe9aeb161289770ece4f6a7e930c8a464aabd0d Mon Sep 17 00:00:00 2001
+From: Dom Cobley <popcornmix@gmail.com>
+Date: Mon, 3 Aug 2026 17:29:35 +0100
+Subject: [PATCH 03/12] [VideoPlayer] DVDDemuxFFmpeg: keep the probed stream
+ parameters across the re-open
+
+For mpegts, Open() runs avformat_find_stream_info() and then throws the whole
+format context away and re-opens it, because the transport stream start time has
+to be established from a context that has not consumed packets. The re-open sets
+m_streaminfo false, so find_stream_info() does not run again and the container
+only knows what the PMT and the first packets told it: no profile, no pixel
+format, no frame rate. Only duration was carried across.
+
+CreateStreams() runs inside the re-open, so the CDemuxStream objects, and the
+hints the player opens its codecs with, are built from those poorer parameters.
+
+Two consequences. The audio and video codecs are opened, then opened again as
+soon as the demuxer fills the gaps in while parsing. And more visibly, the video
+hints have no frame rate, so OpenVideoStream() skips choosing a display mode;
+playback starts in the wrong one until CalcFrameRate() measures the rate from
+decoded frames seconds later and the display is switched mid playback.
+
+Snapshot the probed parameters before Dispose() and fill in what the re-opened
+container left unset, before the streams are built from it.
+
+Two fields are deliberately left alone. extradata, because ResetVideoStreams()
+clears it on purpose so TransportStreamVideoState() waits for the demuxer to find
+it again in the stream, which is what starts playback on an i-frame. And
+ch_layout, because the demuxer puts the channel count back to unknown when it
+re-reads the PMT while the streams keep the restored value, which IsProgramChange()
+reads as a change and rebuilds the streams for nothing.
+
+Measured on a Raspberry Pi 4 (GBM, DRMPRIME/h264_v4l2m2m) with a 1080p23.976
+H.264 m2ts resumed at 180s: the display mode is now chosen at the first open
+instead of 6.7s into playback, the audio codec is opened once instead of three
+times, and two dropped frames at startup become none.
+
+Fixes #28826
+
+(cherry picked from commit 38ef2b7b4717a85f5d56dd9dfa2289e5ce83269f)
+---
+ .../DVDDemuxers/DVDDemuxFFmpeg.cpp            | 148 +++++++++++++++++-
+ .../VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h  |  20 +++
+ 2 files changed, 167 insertions(+), 1 deletion(-)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
+index b84c6abeeb..024dff808e 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
+@@ -629,6 +629,12 @@ bool CDVDDemuxFFmpeg::Open(const std::shared_ptr<CDVDInputStream>& pInput, bool
+   if (!programProp.isNull())
+     m_initialProgramNumber = static_cast<int>(programProp.asInteger());
+ 
++  // The transport stream re-open below skips avformat_find_stream_info(), so put back what the first
++  // probe established (profile, pixel format, channel layout, frame rate, extradata) before the
++  // streams are built from it. Otherwise the player opens its codecs with worse hints than we
++  // already had and has to re-open them as soon as the demuxer fills the gaps in while parsing.
++  RestoreProbedStreamParameters();
++
+   // in case of mpegts and we have not seen pat/pmt, defer creation of streams
+   if (!skipCreateStreams || m_pFormatContext->nb_programs > 0)
+   {
+@@ -691,10 +697,13 @@ bool CDVDDemuxFFmpeg::Open(const std::shared_ptr<CDVDInputStream>& pInput, bool
+   if (m_checkTransportStream && m_streaminfo)
+   {
+     int64_t duration = m_pFormatContext->duration;
++    SaveProbedStreamParameters();
+     std::shared_ptr<CDVDInputStream> pInputStream = m_pInput;
+     Dispose();
+     m_reopen = true;
+-    if (!Open(pInputStream, false))
++    const bool opened = Open(pInputStream, false);
++    ClearProbedStreamParameters();
++    if (!opened)
+       return false;
+     m_pFormatContext->duration = duration;
+   }
+@@ -1634,6 +1643,143 @@ void CDVDDemuxFFmpeg::CreateStreams(unsigned int program)
+   }
+ }
+ 
++void CDVDDemuxFFmpeg::SaveProbedStreamParameters()
++{
++  ClearProbedStreamParameters();
++
++  if (!m_pFormatContext)
++    return;
++
++  for (unsigned int i = 0; i < m_pFormatContext->nb_streams; i++)
++  {
++    const AVStream* st = m_pFormatContext->streams[i];
++    if (!st)
++      continue;
++
++    ProbedStream probed;
++    probed.codecpar.reset(avcodec_parameters_alloc());
++    if (!probed.codecpar)
++      continue;
++
++    if (avcodec_parameters_copy(probed.codecpar.get(), st->codecpar) < 0)
++      continue;
++
++    probed.rFrameRate = st->r_frame_rate;
++    probed.avgFrameRate = st->avg_frame_rate;
++    probed.sampleAspectRatio = st->sample_aspect_ratio;
++    m_probedStreams[static_cast<int>(i)] = std::move(probed);
++  }
++}
++
++void CDVDDemuxFFmpeg::RestoreProbedStreamParameters()
++{
++  if (m_probedStreams.empty() || !m_pFormatContext)
++    return;
++
++  unsigned int restored = 0;
++
++  for (unsigned int i = 0; i < m_pFormatContext->nb_streams; i++)
++  {
++    const auto it = m_probedStreams.find(static_cast<int>(i));
++    if (it == m_probedStreams.end())
++      continue;
++
++    AVStream* st = m_pFormatContext->streams[i];
++    const AVCodecParameters* probed = it->second.codecpar.get();
++    if (!st || !st->codecpar || !probed)
++      continue;
++
++    // A different stream at the same index means the container disagrees with what we probed, so
++    // leave it alone and let the demuxer describe it.
++    if (st->codecpar->codec_type != probed->codec_type ||
++        st->codecpar->codec_id != probed->codec_id)
++    {
++      CLog::LogF(LOGDEBUG, "stream {} changed across the re-open, keeping the current parameters", i);
++      continue;
++    }
++
++    // A video stream the probe could not size has nothing useful to give back.
++    if (probed->codec_type == AVMEDIA_TYPE_VIDEO && (probed->width == 0 || probed->height == 0))
++    {
++      CLog::LogF(LOGDEBUG, "stream {} was not fully probed, leaving it to the demuxer", i);
++      continue;
++    }
++
++    // Only fill in what the re-open does not know. Two fields are deliberately left out:
++    //
++    // extradata, because ResetVideoStreams() clears it on purpose so that TransportStreamVideoState()
++    // waits for the demuxer to find it again in the stream, which is what starts playback on an
++    // i-frame. Putting it back would report the stream ready before that.
++    //
++    // ch_layout, because the demuxer re-reads the PMT and sets the channel count back to unknown
++    // while the streams keep the restored value, and IsProgramChange() reads that difference as a
++    // change and rebuilds the streams for nothing.
++    AVCodecParameters* cur = st->codecpar;
++
++    if (cur->profile == AV_PROFILE_UNKNOWN)
++      cur->profile = probed->profile;
++    if (cur->level == AV_LEVEL_UNKNOWN)
++      cur->level = probed->level;
++    if (cur->format < 0) // AV_PIX_FMT_NONE / AV_SAMPLE_FMT_NONE
++      cur->format = probed->format;
++    if (cur->bit_rate == 0)
++      cur->bit_rate = probed->bit_rate;
++    if (cur->bits_per_coded_sample == 0)
++      cur->bits_per_coded_sample = probed->bits_per_coded_sample;
++    if (cur->bits_per_raw_sample == 0)
++      cur->bits_per_raw_sample = probed->bits_per_raw_sample;
++
++    if (cur->codec_type == AVMEDIA_TYPE_VIDEO)
++    {
++      if (cur->width == 0 || cur->height == 0)
++      {
++        cur->width = probed->width;
++        cur->height = probed->height;
++      }
++      if (cur->sample_aspect_ratio.num == 0)
++        cur->sample_aspect_ratio = probed->sample_aspect_ratio;
++      if (cur->field_order == AV_FIELD_UNKNOWN)
++        cur->field_order = probed->field_order;
++      if (cur->color_range == AVCOL_RANGE_UNSPECIFIED)
++        cur->color_range = probed->color_range;
++      if (cur->color_primaries == AVCOL_PRI_UNSPECIFIED)
++        cur->color_primaries = probed->color_primaries;
++      if (cur->color_trc == AVCOL_TRC_UNSPECIFIED)
++        cur->color_trc = probed->color_trc;
++      if (cur->color_space == AVCOL_SPC_UNSPECIFIED)
++        cur->color_space = probed->color_space;
++      if (cur->chroma_location == AVCHROMA_LOC_UNSPECIFIED)
++        cur->chroma_location = probed->chroma_location;
++
++      if (st->r_frame_rate.num == 0 || st->r_frame_rate.den == 0)
++        st->r_frame_rate = it->second.rFrameRate;
++      if (st->avg_frame_rate.num == 0 || st->avg_frame_rate.den == 0)
++        st->avg_frame_rate = it->second.avgFrameRate;
++      if (st->sample_aspect_ratio.num == 0)
++        st->sample_aspect_ratio = it->second.sampleAspectRatio;
++    }
++    else if (cur->codec_type == AVMEDIA_TYPE_AUDIO)
++    {
++      if (cur->sample_rate == 0)
++        cur->sample_rate = probed->sample_rate;
++      if (cur->block_align == 0)
++        cur->block_align = probed->block_align;
++      if (cur->frame_size == 0)
++        cur->frame_size = probed->frame_size;
++    }
++
++    restored++;
++  }
++
++  CLog::LogF(LOGDEBUG, "restored the probed parameters of {} of {} streams after the re-open",
++             restored, m_probedStreams.size());
++}
++
++void CDVDDemuxFFmpeg::ClearProbedStreamParameters()
++{
++  m_probedStreams.clear();
++}
++
+ void CDVDDemuxFFmpeg::DisposeStreams()
+ {
+   std::map<int, CDemuxStream*>::iterator it;
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
+index 02fdd8fe46..4f535d1fdb 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
+@@ -127,6 +127,9 @@ protected:
+   void CreateStreams(unsigned int program = UINT_MAX);
+   void DisposeStreams();
+   void ParsePacket(AVPacket* pkt);
++  void SaveProbedStreamParameters();
++  void RestoreProbedStreamParameters();
++  void ClearProbedStreamParameters();
+   TRANSPORT_STREAM_STATE TransportStreamAudioState();
+   TRANSPORT_STREAM_STATE TransportStreamVideoState();
+   bool IsTransportStreamReady();
+@@ -173,6 +176,23 @@ protected:
+     int      result;    // result from av_read_packet
+   }m_pkt;
+ 
++  // What avformat_find_stream_info() established before the transport stream re-open below. The
++  // re-open runs without it, so the container would otherwise start out knowing less than the first
++  // probe already told us and the player would open its codecs with worse hints than we had.
++  struct AVCodecParametersDeleter
++  {
++    void operator()(AVCodecParameters* codecpar) const { avcodec_parameters_free(&codecpar); }
++  };
++
++  struct ProbedStream
++  {
++    std::unique_ptr<AVCodecParameters, AVCodecParametersDeleter> codecpar;
++    AVRational rFrameRate{0, 0};
++    AVRational avgFrameRate{0, 0};
++    AVRational sampleAspectRatio{0, 0};
++  };
++  std::map<int, ProbedStream> m_probedStreams;
++
+   bool m_streaminfo;
+   bool m_reopen = false;
+   bool m_checkTransportStream;
+-- 
+2.55.0
+

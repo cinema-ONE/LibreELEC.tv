@@ -26,6 +26,8 @@ case "${PROJECT}" in
   Generic)
     PKG_FFMPEG_REQUEST_DISABLE=""
     PKG_FFMPEG_REQUEST_ENABLE=""
+    # popcornmix's H.264 MVC decoder (dev/mvc/h264_mvc_1), for 3D Blu-ray playback
+    PKG_PATCH_DIRS+=" mvc"
     ;;
   Rockchip)
     case "${DEVICE}" in

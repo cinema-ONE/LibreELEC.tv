@@ -1,0 +1,55 @@
+From 0e25c097fa2b3f0d49f98b92acad0e6caeb65a43 Mon Sep 17 00:00:00 2001
+From: Dom Cobley <popcornmix@gmail.com>
+Date: Thu, 3 Sep 2026 14:13:20 +0100
+Subject: [PATCH 07/12] StereoscopicsManager: compare the arrangement asked
+ for, not the one on screen
+
+SetStereoMode() records the arrangement wanted and Flip() makes it current, so the
+two differ for the rest of the frame. ApplyStereoMode() compared its target against
+the current one, which left it blind to a request already queued: asked for the
+arrangement the graphics context is about to leave, it saw nothing to do and
+returned, and the queued request stood.
+
+A title starting from a disc menu does exactly that. The outgoing title's
+arrangement is cleared and the incoming one detected within a frame of each other,
+on separate threads, and whichever arrived first won. Where the clearing went first
+the detection was dropped, the flip put the GUI in off, and the display mode search
+- which reads the arrangement asked for rather than the one on screen - then chose a
+plain 2D mode for a stereoscopic source. The setting said one thing and the output
+another, with nothing left to re-apply it, so the picture stayed side by side for
+the rest of the title. Playing that title on its own was fine, having no outgoing
+arrangement to clear.
+
+The reporter of this saw it on one disc of five, and only from its menu. Two
+arrangements 24ms apart lost it, 54ms apart did not.
+
+Compare against GetNextStereoMode(), which is what the graphics context already
+asks callers deciding an output arrangement to use.
+
+(cherry picked from commit baebd06db7ef4de12b00b4f87d7109590407e685)
+---
+ xbmc/guilib/StereoscopicsManager.cpp | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/xbmc/guilib/StereoscopicsManager.cpp b/xbmc/guilib/StereoscopicsManager.cpp
+index e7ffd2f3a7..c9218f9c09 100644
+--- a/xbmc/guilib/StereoscopicsManager.cpp
++++ b/xbmc/guilib/StereoscopicsManager.cpp
+@@ -577,7 +577,13 @@ bool CStereoscopicsManager::OnAction(const CAction &action)
+ 
+ void CStereoscopicsManager::ApplyStereoMode(const RenderStereoMode mode, bool notify)
+ {
+-  RenderStereoMode currentMode = CServiceBroker::GetWinSystem()->GetGfxContext().GetStereoMode();
++  // The arrangement already asked for, which is not the one in use until the next flip.
++  // Two arrangements chosen for the same title arrive within a frame of each other - the
++  // outgoing one being cleared, then the incoming one being detected - and comparing
++  // against the arrangement in use would read the second as a no-op and leave the first
++  // one queued.
++  const RenderStereoMode currentMode{
++      CServiceBroker::GetWinSystem()->GetGfxContext().GetNextStereoMode()};
+   CLog::Log(LOGDEBUG,
+             "StereoscopicsManager::ApplyStereoMode: trying to apply stereo mode. Current: {} | "
+             "Target: {}",
+-- 
+2.55.0
+
