@@ -1,7 +1,7 @@
 diff -ruN /private/tmp/claude-501/-Users-adrian-code-xbmc-xbmc/6566a1a5-410d-46f0-9d20-045e0b642209/scratchpad/k723p/linux-7.2.3/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c linux-7.2.3/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
 --- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c	2026-09-04 19:38:45
 +++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c	2026-09-04 20:53:59
-@@ -7014,7 +7014,26 @@
+@@ -7014,7 +7014,29 @@
  	else
  		timing_out->pixel_encoding = PIXEL_ENCODING_RGB;
  
@@ -17,9 +17,12 @@ diff -ruN /private/tmp/claude-501/-Users-adrian-code-xbmc-xbmc/6566a1a5-410d-46f
 +		timing_out->timing_3d_format = TIMING_3D_FORMAT_NONE;
 +		stream->view_format = VIEW_3D_FORMAT_NONE;
 +		break;
++	/* Frame packing likewise: the doubled 2205-line frame is already laid
++	 * out by the application (eye, 45-line gap, eye), so scan it out as 2D
++	 * too; DC's stereo programming would re-pack it. */
 +	case DRM_MODE_FLAG_3D_FRAME_PACKING:
-+		timing_out->timing_3d_format = TIMING_3D_FORMAT_SW_FRAME_PACKING;
-+		stream->view_format = VIEW_3D_FORMAT_FRAME_SEQUENTIAL;
++		timing_out->timing_3d_format = TIMING_3D_FORMAT_NONE;
++		stream->view_format = VIEW_3D_FORMAT_NONE;
 +		break;
 +	default:
 +		timing_out->timing_3d_format = TIMING_3D_FORMAT_NONE;
