@@ -1,0 +1,51 @@
+From e1fe55d6991e18aaeab678c8454d6833646c56a0 Mon Sep 17 00:00:00 2001
+From: cinemaONE <35371193+cinema-ONE@users.noreply.github.com>
+Date: Sat, 5 Sep 2026 14:11:20 +0200
+Subject: [PATCH] INSTRUMENT: log stereo crop flags/view/source rect per eye
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ .../VideoPlayer/VideoRenderers/BaseRenderer.cpp     | 13 +++++++++++++
+ .../VideoRenderers/LinuxRendererGLES.cpp            |  2 ++
+ 2 files changed, 15 insertions(+)
+
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/BaseRenderer.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/BaseRenderer.cpp
+index d116b73c22..0a9805b2b8 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/BaseRenderer.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/BaseRenderer.cpp
+@@ -352,6 +352,19 @@ void CBaseRenderer::ManageRenderArea()
+   const bool eyeCropped =
+       (stereo_view == RenderStereoView::LEFT || stereo_view == RenderStereoView::RIGHT);
+ 
++  // INSTRUMENT (3D crop investigation): one line per ~2 s per eye
++  {
++    static unsigned int s_calls = 0;
++    if ((s_calls++ % 96) < 2)
++      CLog::Log(LOGINFO,
++                "STEREOCROP ManageRenderArea: flags=0x{:x} stereo_mode=0x{:x} view={} gfxview={} "
++                "src=({:.0f},{:.0f},{:.0f},{:.0f}) viewRect=({:.0f},{:.0f},{:.0f},{:.0f}) source={}x{}",
++                m_iFlags, stereo_mode, static_cast<int>(stereo_view),
++                static_cast<int>(CServiceBroker::GetWinSystem()->GetGfxContext().GetStereoView()),
++                m_sourceRect.x1, m_sourceRect.y1, m_sourceRect.x2, m_sourceRect.y2, m_viewRect.x1,
++                m_viewRect.y1, m_viewRect.x2, m_viewRect.y2, m_sourceWidth, m_sourceHeight);
++  }
++
+   CalcNormalRenderRect(m_viewRect.x1, m_viewRect.y1, m_viewRect.Width(), m_viewRect.Height(),
+                        (eyeCropped ? GetPerEyeAspectRatio() : GetAspectRatio()) *
+                            CDisplaySettings::GetInstance().GetPixelRatio(),
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.cpp
+index e990d9bf65..f41b6df09c 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.cpp
+@@ -192,6 +192,8 @@ bool CLinuxRendererGLES::Configure(const VideoPicture &picture, float fps, unsig
+ 
+   m_iFlags =
+       GetFlagsChromaPosition(picture.chroma_position) | GetFlagsStereoMode(picture.stereoMode);
++  CLog::Log(LOGINFO, "STEREOCROP GLES Configure: stereoMode='{}' flags=0x{:x} {}x{}",
++            picture.stereoMode, m_iFlags, picture.iWidth, picture.iHeight);
+ 
+   m_srcPrimaries = picture.color_primaries;
+   m_srcColorBits = picture.colorBits;
+-- 
+2.55.0
+
