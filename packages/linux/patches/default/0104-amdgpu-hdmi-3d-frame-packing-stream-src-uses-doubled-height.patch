@@ -1,0 +1,18 @@
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c	2026-09-05 15:55:36
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c	2026-09-05 15:55:36
+@@ -6738,9 +6738,12 @@
+ 	if (!mode)
+ 		return;
+ 
+-	/* Full screen scaling by default */
+-	src.width = mode->hdisplay;
+-	src.height = mode->vdisplay;
++	/* Full screen scaling by default. A frame-packed 3D mode scans out the
++	 * doubled timing (two eyes plus the active space), so take the CRTC
++	 * height, not the per-eye vdisplay: with 1080 here against a 2205-line
++	 * destination the aspect fit keeps 1080 lines and centres them, showing
++	 * the first eye across both eye windows and none of the second. */
++	drm_mode_get_hv_timing(mode, &src.width, &src.height);
+ 	dst.width = stream->timing.h_addressable;
+ 	dst.height = stream->timing.v_addressable;
+ 
