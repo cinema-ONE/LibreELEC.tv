@@ -1,0 +1,34 @@
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c	2026-09-05 14:56:54
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c	2026-09-05 14:56:54
+@@ -7745,8 +7745,30 @@
+ 	update_stream_signal(stream, sink);
+ 
+ 	if (stream->signal == SIGNAL_TYPE_HDMI_TYPE_A ||
+-	    stream->signal == SIGNAL_TYPE_HDMI_FRL)
++	    stream->signal == SIGNAL_TYPE_HDMI_FRL) {
++		/* Side-by-side and top-and-bottom are packed by the application
++		 * into an ordinary 2D frame: the display core scans it out as 2D
++		 * and only the vendor infoframe tells the sink about the layout. */
++		enum dc_timing_3d_format saved_3d = stream->timing.timing_3d_format;
++		enum view_3d_format saved_view = stream->view_format;
++
++		switch (mode.flags & DRM_MODE_FLAG_3D_MASK) {
++		case DRM_MODE_FLAG_3D_TOP_AND_BOTTOM:
++			stream->timing.timing_3d_format = TIMING_3D_FORMAT_TB_SW_PACKED;
++			stream->view_format = VIEW_3D_FORMAT_TOP_AND_BOTTOM;
++			break;
++		case DRM_MODE_FLAG_3D_SIDE_BY_SIDE_HALF:
++		case DRM_MODE_FLAG_3D_SIDE_BY_SIDE_FULL:
++			stream->timing.timing_3d_format = TIMING_3D_FORMAT_SBS_SW_PACKED;
++			stream->view_format = VIEW_3D_FORMAT_SIDE_BY_SIDE;
++			break;
++		default:
++			break;
++		}
+ 		mod_build_hf_vsif_infopacket(stream, &stream->vsp_infopacket, false, false);
++		stream->timing.timing_3d_format = saved_3d;
++		stream->view_format = saved_view;
++	}
+ 
+ 	if (stream->signal == SIGNAL_TYPE_DISPLAY_PORT ||
+ 	    stream->signal == SIGNAL_TYPE_DISPLAY_PORT_MST ||
