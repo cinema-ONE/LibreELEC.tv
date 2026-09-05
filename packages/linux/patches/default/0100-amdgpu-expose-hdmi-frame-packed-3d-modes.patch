@@ -119,11 +119,13 @@ diff -ruN /private/tmp/claude-501/-Users-adrian-code-xbmc-xbmc/6566a1a5-410d-46f
 diff -ruN /private/tmp/claude-501/-Users-adrian-code-xbmc-xbmc/6566a1a5-410d-46f0-9d20-045e0b642209/scratchpad/k723p/linux-7.2.3/drivers/gpu/drm/amd/display/dc/optc/dcn10/dcn10_optc.c linux-7.2.3/drivers/gpu/drm/amd/display/dc/optc/dcn10/dcn10_optc.c
 --- a/drivers/gpu/drm/amd/display/dc/optc/dcn10/dcn10_optc.c	2026-09-04 19:38:45
 +++ b/drivers/gpu/drm/amd/display/dc/optc/dcn10/dcn10_optc.c	2026-09-04 20:53:59
-@@ -608,6 +608,7 @@
+@@ -608,6 +608,9 @@
  
  	if (timing->timing_3d_format != TIMING_3D_FORMAT_NONE &&
  		timing->timing_3d_format != TIMING_3D_FORMAT_HW_FRAME_PACKING &&
 +		timing->timing_3d_format != TIMING_3D_FORMAT_SW_FRAME_PACKING &&
++		timing->timing_3d_format != TIMING_3D_FORMAT_SBS_SW_PACKED &&
++		timing->timing_3d_format != TIMING_3D_FORMAT_TB_SW_PACKED &&
  		timing->timing_3d_format != TIMING_3D_FORMAT_TOP_AND_BOTTOM &&
  		timing->timing_3d_format != TIMING_3D_FORMAT_SIDE_BY_SIDE &&
  		timing->timing_3d_format != TIMING_3D_FORMAT_FRAME_ALTERNATE &&
