@@ -105,21 +105,6 @@ diff -ruN /private/tmp/claude-501/-Users-adrian-code-xbmc-xbmc/6566a1a5-410d-46f
  
  			if (viewport_width < 0 || viewport_height < 0) {
  				DRM_DEBUG_ATOMIC("Plane completely outside of screen\n");
-diff -ruN /private/tmp/claude-501/-Users-adrian-code-xbmc-xbmc/6566a1a5-410d-46f0-9d20-045e0b642209/scratchpad/k723p/linux-7.2.3/drivers/gpu/drm/amd/display/dc/core/dc_resource.c linux-7.2.3/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
---- a/drivers/gpu/drm/amd/display/dc/core/dc_resource.c	2026-09-02 14:33:21
-+++ b/drivers/gpu/drm/amd/display/dc/core/dc_resource.c	2026-09-04 20:53:59
-@@ -4912,8 +4912,10 @@
- 
- 	switch (stream->content_type) {
- 	case DISPLAY_CONTENT_TYPE_NO_DATA:
-+		/* No content type set: do not flag the stream as IT content, so a
-+		 * sink keeps its video processing (3D, motion, ...) enabled. */
- 		hdmi_info.bits.CN0_CN1 = 0;
--		hdmi_info.bits.ITC = 1;
-+		hdmi_info.bits.ITC = 0;
- 		break;
- 	case DISPLAY_CONTENT_TYPE_GRAPHICS:
- 		hdmi_info.bits.CN0_CN1 = 0;
 diff -ruN /private/tmp/claude-501/-Users-adrian-code-xbmc-xbmc/6566a1a5-410d-46f0-9d20-045e0b642209/scratchpad/k723p/linux-7.2.3/drivers/gpu/drm/amd/display/dc/optc/dcn10/dcn10_optc.c linux-7.2.3/drivers/gpu/drm/amd/display/dc/optc/dcn10/dcn10_optc.c
 --- a/drivers/gpu/drm/amd/display/dc/optc/dcn10/dcn10_optc.c	2026-09-04 19:38:45
 +++ b/drivers/gpu/drm/amd/display/dc/optc/dcn10/dcn10_optc.c	2026-09-04 20:53:59
