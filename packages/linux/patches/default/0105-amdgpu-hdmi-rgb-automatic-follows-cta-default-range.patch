@@ -1,0 +1,63 @@
+From: Adrian Betschart <adrian.betschart@cinemaone.ch>
+Subject: [PATCH] drm/amd/display: Default HDMI RGB output to limited range on CTA modes
+
+Backport to 7.2.4 of the drm-next patch sent to amd-gfx (issue
+https://gitlab.freedesktop.org/drm/amd/-/issues/5796): with Broadcast RGB at
+Automatic the RGB output followed full range while the AVI InfoFrame carried
+the default (limited) quantization. Follow the CTA-861 default instead, as the
+DRM HDMI helper and i915 do. In 7.2.4 the function lives in amdgpu_dm.c and the
+BT.2020 RGB branch had no range check at all.
+
+Signed-off-by: Adrian Betschart <adrian.betschart@cinemaone.ch>
+Assisted-by: Claude Code:claude-fable-5-1
+---
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -6847,6 +6847,24 @@
+ {
+ 	/* 1-1 mapping, since both enums follow the HDMI spec. */
+ 	return (enum dc_aspect_ratio) mode_in->picture_aspect_ratio;
++}
++
++/*
++ * CTA-861 5.1: RGB video formats default to limited range except 640x480 (VIC 1).
++ * With Broadcast RGB left at Automatic follow that default, as i915 does.
++ */
++static bool rgb_output_is_limited_range(const struct dc_crtc_timing *dc_crtc_timing,
++					const struct drm_connector_state *connector_state)
++{
++	switch (connector_state->hdmi.broadcast_rgb) {
++	case DRM_HDMI_BROADCAST_RGB_FULL:
++		return false;
++	case DRM_HDMI_BROADCAST_RGB_LIMITED:
++		return true;
++	default:
++		return connector_state->connector->display_info.is_hdmi &&
++		       dc_crtc_timing->vic > 1;
++	}
+ }
+ 
+ static enum dc_color_space
+@@ -6873,16 +6891,18 @@
+ 		break;
+ 	case DRM_MODE_COLORIMETRY_BT2020_RGB:
+ 	case DRM_MODE_COLORIMETRY_BT2020_YCC:
+-		if (dc_crtc_timing->pixel_encoding == PIXEL_ENCODING_RGB)
+-			color_space = COLOR_SPACE_2020_RGB_FULLRANGE;
+-		else
++		if (dc_crtc_timing->pixel_encoding != PIXEL_ENCODING_RGB)
+ 			color_space = COLOR_SPACE_2020_YCBCR_LIMITED;
++		else if (rgb_output_is_limited_range(dc_crtc_timing, connector_state))
++			color_space = COLOR_SPACE_2020_RGB_LIMITEDRANGE;
++		else
++			color_space = COLOR_SPACE_2020_RGB_FULLRANGE;
+ 		break;
+ 	case DRM_MODE_COLORIMETRY_DEFAULT: // ITU601
+ 	default:
+ 		if (dc_crtc_timing->pixel_encoding == PIXEL_ENCODING_RGB) {
+ 			color_space = COLOR_SPACE_SRGB;
+-			if (connector_state->hdmi.broadcast_rgb == DRM_HDMI_BROADCAST_RGB_LIMITED)
++			if (rgb_output_is_limited_range(dc_crtc_timing, connector_state))
+ 				color_space = COLOR_SPACE_SRGB_LIMITED;
+ 		/*
+ 		 * 27030khz is the separation point between HDTV and SDTV
