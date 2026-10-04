@@ -1,0 +1,54 @@
+dcn30_hpo_frl_stream_encoder.c, above `static int hpo_frl_packet_line_mode;`:
+Test knob (cinemaONE, 2026-09-26, the NUC's 8K60 HDR investigation): the
+blanking line the generic packets are sent on. Upstream sends them all on
+line 2 ("TODO: check if line 2 is correct"). At 8K60 with DSC that line
+also carries the PPS in CVTEM slots 5-10, and adding the HDR static
+metadata packet (slot 4) may overflow it.
+  0  all on line 2 (upstream)
+  1  the HDR static metadata packet (slot 4) on line 3
+  2  everything but the DSC PPS (slots 5-10) on line 3
+  3  everything on line 3
+Read at every packet update, so writing the parameter takes effect at the
+next full mode set.
+
+diff --git a/drivers/gpu/drm/amd/display/dc/hpo/dcn30/dcn30_hpo_frl_stream_encoder.c b/drivers/gpu/drm/amd/display/dc/hpo/dcn30/dcn30_hpo_frl_stream_encoder.c
+index cff5c95..5b768e6 100644
+--- a/drivers/gpu/drm/amd/display/dc/hpo/dcn30/dcn30_hpo_frl_stream_encoder.c
++++ b/drivers/gpu/drm/amd/display/dc/hpo/dcn30/dcn30_hpo_frl_stream_encoder.c
+@@ -32,6 +32,27 @@
+ #include "dcn_calc_math.h"
+ #include "dml/dcn30/dcn30_fpu.h"
+ 
++#include <linux/moduleparam.h>
++
++static int hpo_frl_packet_line_mode;
++module_param_named(dc_hpo_frl_packet_line_mode, hpo_frl_packet_line_mode, int, 0644);
++MODULE_PARM_DESC(dc_hpo_frl_packet_line_mode,
++		 "HDMI FRL generic packet line: 0 all on 2 (default), 1 HDR on 3, 2 all but the DSC PPS on 3, 3 all on 3");
++
++static uint32_t hpo_frl_packet_line(uint32_t packet_index)
++{
++	switch (hpo_frl_packet_line_mode) {
++	case 1:
++		return packet_index == 4 ? 3 : 2;
++	case 2:
++		return (packet_index >= 5 && packet_index <= 10) ? 2 : 3;
++	case 3:
++		return 3;
++	default:
++		return 2;
++	}
++}
++
+ #undef DC_LOGGER
+ #define DC_LOGGER enc3->base.ctx->logger
+ 
+@@ -343,7 +364,7 @@ void hpo_enc3_update_hdmi_info_packet(struct dcn30_hpo_frl_stream_encoder *enc3,
+ 		send = 1;
+ 		/* select line number to send packets on */
+ 		/* TODO: check if line 2 is correct */
+-		line = 2;
++		line = hpo_frl_packet_line(packet_index);
+ 	} else {
+ 		cont = 0;
+ 		send = 0;

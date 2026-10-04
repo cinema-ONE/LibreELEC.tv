@@ -1,0 +1,39 @@
+amdgpu_dm.c, above `static int frl_status_poll_mode;`:
+  2  as 1, and the poll only runs when it can take dc_lock (trylock): with
+     1 the poll ran through the next commit's link training, cleared the
+     FLT_Update the training was waiting for and fired a retrain at a link
+     in the middle of a commit, and the NUC hung (2026-09-26). A commit
+     holds dc_lock across dc_commit_streams, and cancels this work
+     (cancel_delayed_work_sync) while holding it, so the work must never
+     wait for the lock: it skips the round instead.
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index 9a337a3..ce07c8c 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -2009,7 +2009,7 @@ static int amdgpu_dm_init_power_module(struct amdgpu_display_manager *dm)
+ static int frl_status_poll_mode;
+ module_param_named(dc_hpo_frl_status_poll_mode, frl_status_poll_mode, int, 0644);
+ MODULE_PARM_DESC(dc_hpo_frl_status_poll_mode,
+-		 "HDMI FRL status polling: 0 as 7.2.3 (never polls), 1 as upstream df94112ceebf (polls a link with an FRL rate)");
++		 "HDMI FRL status polling: 0 as 7.2.3 (never polls), 1 as upstream df94112ceebf (polls a link with an FRL rate), 2 as 1 but never during a commit");
+ 
+ static void hdmi_frl_status_polling_work(struct work_struct *work)
+ {
+@@ -2029,6 +2029,16 @@ static void hdmi_frl_status_polling_work(struct work_struct *work)
+ 		if (!dc_is_hdmi_signal(dc_link->connector_signal))
+ 			continue;
+ 
++		if (frl_status_poll_mode == 2) {
++			if (!mutex_trylock(&dm->dc_lock))
++				continue; /* a commit is running: not this round */
++			if (dc_link->frl_link_settings.frl_link_rate != 0 &&
++			    dc_link_frl_poll_status_flag(dc_link))
++				dc_link_detect(dc_link, DETECT_REASON_RETRAIN);
++			mutex_unlock(&dm->dc_lock);
++			continue;
++		}
++
+ 		if (frl_status_poll_mode == 1) {
+ 			if (dc_link->frl_link_settings.frl_link_rate == 0)
+ 				continue;

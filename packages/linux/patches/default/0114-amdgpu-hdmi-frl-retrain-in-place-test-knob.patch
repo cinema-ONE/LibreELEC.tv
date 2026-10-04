@@ -1,0 +1,54 @@
+link_hdmi_frl.c, above `static int frl_retrain_in_place;`:
+Test knob (cinemaONE, 2026-09-27): serve a sink's FLT_Update in place. The
+status poll (live with df94112ceebf's gate) answers FLT_Update with a link
+training and then asks for dc_link_detect(RETRAIN), which on a board with a
+single HDMI connector takes the destructive path (turns the stream off,
+verifies the link at its cap) and hung the NUC (drm/amd#5897). With 1, a
+training that passes goes on to LTS:P instead -- the FRL output enabled and
+FRL_Start awaited, as when a stream is enabled -- and no detect is asked
+for: the stream and its timing generator are never touched.
+  0  upstream (the poll's training, then the RETRAIN detect)
+  1  the training, then LTS:P in place; no detect
+
+diff --git a/drivers/gpu/drm/amd/display/dc/link/protocols/link_hdmi_frl.c b/drivers/gpu/drm/amd/display/dc/link/protocols/link_hdmi_frl.c
+index 73cf090..1b75a64 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/protocols/link_hdmi_frl.c
++++ b/drivers/gpu/drm/amd/display/dc/link/protocols/link_hdmi_frl.c
+@@ -64,6 +64,11 @@ bool hdmi_frl_ltsp_retrain_enabled(void)
+ 	return frl_ltsp_mode == 1;
+ }
+ 
++static int frl_retrain_in_place;
++module_param_named(dc_hpo_frl_retrain_in_place, frl_retrain_in_place, int, 0644);
++MODULE_PARM_DESC(dc_hpo_frl_retrain_in_place,
++		 "HDMI FRL status poll: 0 retrain then RETRAIN detect (upstream), 1 retrain then LTS:P in place, no detect");
++
+ #define DC_LOGGER \
+ 	dc_logger
+ #define DC_LOGGER_INIT(logger) \
+@@ -313,11 +318,23 @@ bool hdmi_frl_poll_status_flag(struct dc_link *link)
+ 			}
+ 		} else
+ 			if (!flt_no_timeout) {
++				enum link_result trained;
++
+ 				hdmi_frl_LTS_clear_Link_Setting(link->ddc);
+ 				hdmi_frl_LTS_clear_Update_flag(link->ddc);
+ 				hpo_frl_link_enc->funcs->set_hdmi_training_pattern(hpo_frl_link_enc, 0, 0, 0, 0);
+-				hdmi_frl_perform_link_training_with_retries(link);
+-				link_update = true;
++				trained = hdmi_frl_perform_link_training_with_retries(link);
++				if (frl_retrain_in_place == 1) {
++					/* cinemaONE test: LTS:P in place, no destructive detect */
++					bool started = trained == LINK_RESULT_SUCCESS &&
++							hdmi_frl_start_video_with_retrain(link);
++
++					FRL_INFO("FRL STATUS POLL:  FLT_UPDATE served in place (LTP %d %d %d %d): training %s, FRL_START %s\n",
++							ln0_pattern, ln1_pattern, ln2_pattern, ln3_pattern,
++							trained == LINK_RESULT_SUCCESS ? "passed" : "failed",
++							started ? "seen" : "not seen");
++				} else
++					link_update = true;
+ 			}
+ 
+ 		write_buffer[0] = HDMI_SCDC_UPDATE_0;

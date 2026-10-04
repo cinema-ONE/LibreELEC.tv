@@ -1,0 +1,171 @@
+link_hdmi_frl.c, above `static int frl_ltsp_mode;`:
+Test knob (cinemaONE, 2026-09-26): LTS:P as the data says it should be.
+The JVC NZ9 sets FRL_Start after 60-120 ms or 400-530 ms (slow when the
+training follows a recent mode change), and sometimes sets FLT_Update in
+LTS:P instead. Upstream enables video after ~200 ms either way, and the
+screen stays dark.
+  0  upstream (dc_hpo_frl_start_polls, busy-waiting)
+  1  poll FRL_Start every 2 ms, sleeping, for up to dc_hpo_frl_ltsp_wait_ms;
+     on a timeout or FLT_Update go back into link training (at most 3
+     trainings), and only then enable video anyway
+No status poll is involved: live, its retrain turned a late start into a
+hard hang on this single-HDMI board.
+
+link_hdmi_frl.c, above `bool hdmi_frl_start_video_with_retrain(struct dc_link *link)`:
+cinemaONE test (dc_hpo_frl_ltsp_mode=1): enable the FRL output and wait for
+FRL_Start; when it does not come, or the sink asks for training again, go
+back into training rather than send video to a sink that is not ready.
+Returns whether FRL_Start came; after 3 trainings the caller enables video
+anyway, as upstream always does.
+
+diff --git a/drivers/gpu/drm/amd/display/dc/link/link_dpms.c b/drivers/gpu/drm/amd/display/dc/link/link_dpms.c
+index ca59977..76fffe0 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/link_dpms.c
++++ b/drivers/gpu/drm/amd/display/dc/link/link_dpms.c
+@@ -1999,12 +1999,17 @@ static enum dc_status enable_link_hdmi_frl(struct pipe_ctx *pipe_ctx)
+ 
+ 	/* Enable FRL packet transmission */
+ 	if (link_stat == LINK_RESULT_SUCCESS) {
+-		stream->link->hpo_frl_link_enc->funcs->enable_output(
+-				stream->link->hpo_frl_link_enc);
+-		if (stream->link->frl_flags.apply_vsdb_rcc_wa)
+-			stream->link->hpo_frl_link_enc->funcs->apply_vsdb_rcc_wa(stream->link->hpo_frl_link_enc);
+-		if (frl_poll_start)
+-			hdmi_frl_poll_start(stream->link->ddc);
++		if (frl_poll_start && hdmi_frl_ltsp_retrain_enabled()) {
++			/* cinemaONE test knob dc_hpo_frl_ltsp_mode=1 */
++			hdmi_frl_start_video_with_retrain(stream->link);
++		} else {
++			stream->link->hpo_frl_link_enc->funcs->enable_output(
++					stream->link->hpo_frl_link_enc);
++			if (stream->link->frl_flags.apply_vsdb_rcc_wa)
++				stream->link->hpo_frl_link_enc->funcs->apply_vsdb_rcc_wa(stream->link->hpo_frl_link_enc);
++			if (frl_poll_start)
++				hdmi_frl_poll_start(stream->link->ddc);
++		}
+ 
+ 		FRL_INFO("FRL LINK TRAINING:  LTS:P Success\n");
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/link/protocols/link_hdmi_frl.c b/drivers/gpu/drm/amd/display/dc/link/protocols/link_hdmi_frl.c
+index 1d3e8c9..73cf090 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/protocols/link_hdmi_frl.c
++++ b/drivers/gpu/drm/amd/display/dc/link/protocols/link_hdmi_frl.c
+@@ -50,6 +50,20 @@ module_param_named(dc_hpo_frl_start_polls, frl_start_polls, int, 0644);
+ MODULE_PARM_DESC(dc_hpo_frl_start_polls,
+ 		 "HDMI FRL LTS:P: FRL_Start polls, 2 ms apart, before enabling video anyway (default 100)");
+ 
++static int frl_ltsp_mode;
++module_param_named(dc_hpo_frl_ltsp_mode, frl_ltsp_mode, int, 0644);
++MODULE_PARM_DESC(dc_hpo_frl_ltsp_mode,
++		 "HDMI FRL LTS:P: 0 upstream, 1 sleep-poll FRL_Start up to dc_hpo_frl_ltsp_wait_ms and retrain on a timeout or FLT_Update");
++static int frl_ltsp_wait_ms = 1000;
++module_param_named(dc_hpo_frl_ltsp_wait_ms, frl_ltsp_wait_ms, int, 0644);
++MODULE_PARM_DESC(dc_hpo_frl_ltsp_wait_ms,
++		 "HDMI FRL LTS:P with dc_hpo_frl_ltsp_mode=1: how long to wait for FRL_Start, in ms (default 1000, at most 10000)");
++
++bool hdmi_frl_ltsp_retrain_enabled(void)
++{
++	return frl_ltsp_mode == 1;
++}
++
+ #define DC_LOGGER \
+ 	dc_logger
+ #define DC_LOGGER_INIT(logger) \
+@@ -343,7 +357,7 @@ bool hdmi_frl_poll_status_flag(struct dc_link *link)
+ 	return link_update;
+ }
+ 
+-void hdmi_frl_poll_start(struct ddc_service *ddc_service)
++bool hdmi_frl_poll_start(struct ddc_service *ddc_service)
+ {
+ 	uint8_t slave_address = HDMI_SCDC_ADDRESS;
+ 	uint8_t offset = HDMI_SCDC_UPDATE_0;
+@@ -368,7 +382,38 @@ void hdmi_frl_poll_start(struct ddc_service *ddc_service)
+ 
+ 	/*Test Condition - No need to poll FRL_START if FLT_no_timeout*/
+ 	if (flt_no_timeout)
+-		return;
++		return true;
++
++	if (frl_ltsp_mode == 1) {
++		/* cinemaONE test: sleep between polls, and report what came */
++		uint16_t polls = (frl_ltsp_wait_ms < 2 ? 2 :
++				(frl_ltsp_wait_ms > 10000 ? 10000 : frl_ltsp_wait_ms)) / 2;
++		uint16_t left;
++
++		offset = HDMI_SCDC_UPDATE_0;
++		for (left = polls; left; left--) {
++			usleep_range(2000, 2500);
++			link_query_ddc_data(ddc_service, slave_address,
++					&offset, sizeof(offset), &scdc_update.byte[0],
++					sizeof(scdc_update.byte[0]));
++			FRL_INFO("FRL LINK TRAINING:  Read FRL_START = %d, FLT_UPDATE = %d.  num_polls = %d\n",
++					scdc_update.fields.FRL_START, scdc_update.fields.FLT_UPDATE, left);
++			if (scdc_update.fields.FRL_START == 1 || scdc_update.fields.FLT_UPDATE == 1) {
++				write_buffer[0] = HDMI_SCDC_UPDATE_0;
++				write_buffer[1] = (scdc_update.fields.FRL_START << 4) |
++						(scdc_update.fields.FLT_UPDATE << 5);
++				link_query_ddc_data(ddc_service, slave_address,
++						write_buffer, sizeof(write_buffer), NULL, 0);
++				if (scdc_update.fields.FRL_START == 1)
++					return true;
++				FRL_INFO("FRL LINK TRAINING:  LTS:P FLT_UPDATE after %d of %d polls; back to training\n",
++						polls - left + 1, polls);
++				return false;
++			}
++		}
++		FRL_INFO("FRL LINK TRAINING:  LTS:P no FRL_START within %d polls; back to training\n", polls);
++		return false;
++	}
+ 
+ 	offset = HDMI_SCDC_UPDATE_0;
+ 	/*LTS:P: Check FRL_START, poll for 200ms */
+@@ -405,7 +450,32 @@ void hdmi_frl_poll_start(struct ddc_service *ddc_service)
+ 	else if (!frl_start)
+ 		FRL_INFO("FRL LINK TRAINING:  LTS:P no FRL_START after %d polls; enabling video anyway\n",
+ 				budget);
+-	return;
++	return frl_start;
++}
++
++bool hdmi_frl_start_video_with_retrain(struct dc_link *link)
++{
++	int attempt;
++
++	DC_LOGGER_INIT(link->ctx->logger);
++
++	for (attempt = 1; ; attempt++) {
++		link->hpo_frl_link_enc->funcs->enable_output(link->hpo_frl_link_enc);
++		if (link->frl_flags.apply_vsdb_rcc_wa)
++			link->hpo_frl_link_enc->funcs->apply_vsdb_rcc_wa(link->hpo_frl_link_enc);
++		if (hdmi_frl_poll_start(link->ddc))
++			return true;
++		if (attempt >= 3) {
++			FRL_INFO("FRL LINK TRAINING:  LTS:P no FRL_START after %d trainings; enabling video anyway\n",
++					attempt);
++			return false;
++		}
++		FRL_INFO("FRL LINK TRAINING:  LTS:P retraining, attempt %d\n", attempt + 1);
++		if (hdmi_frl_perform_link_training_with_retries(link) != LINK_RESULT_SUCCESS) {
++			FRL_INFO("FRL LINK TRAINING:  LTS:P retraining failed; enabling video anyway\n");
++			return false;
++		}
++	}
+ }
+ 
+ void hdmi_frl_LTS_clear_Link_Setting(struct ddc_service *ddc_service)
+diff --git a/drivers/gpu/drm/amd/display/dc/link/protocols/link_hdmi_frl.h b/drivers/gpu/drm/amd/display/dc/link/protocols/link_hdmi_frl.h
+index abeec56..0c497e2 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/protocols/link_hdmi_frl.h
++++ b/drivers/gpu/drm/amd/display/dc/link/protocols/link_hdmi_frl.h
+@@ -28,7 +28,9 @@
+ enum clock_source_id hdmi_frl_find_matching_phypll(
+ 		struct dc_link *link);
+ void hdmi_frl_LTS_clear_Update_flag(struct ddc_service *ddc_service);
+-void hdmi_frl_poll_start(struct ddc_service *ddc_service);
++bool hdmi_frl_poll_start(struct ddc_service *ddc_service);
++bool hdmi_frl_ltsp_retrain_enabled(void);
++bool hdmi_frl_start_video_with_retrain(struct dc_link *link);
+ void hdmi_frl_LTS_clear_Link_Setting(struct ddc_service *ddc_service);
+ void hdmi_frl_retrieve_link_cap(struct dc_link *link, struct dc_sink *sink);
+ enum link_result hdmi_frl_perform_link_training_with_retries(

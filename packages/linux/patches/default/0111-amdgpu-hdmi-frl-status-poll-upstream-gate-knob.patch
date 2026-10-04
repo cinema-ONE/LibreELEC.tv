@@ -1,0 +1,39 @@
+amdgpu_dm.c, above `static int frl_status_poll_mode;`:
+Test knob (cinemaONE, 2026-09-26): which links the 200 ms FRL status poll
+serves. 7.2.3 skips every link whose connector_signal is not HDMI_FRL, and
+connector_signal is HDMI_TYPE_A for an HDMI port (link_factory.c) and never
+changes, so the poll never reaches a sink: a late FRL_Start is never
+acknowledged and an FLT_Update is never answered with a retrain. Upstream
+df94112ceebf ("Gate HDMI FRL status polling on active FRL link rate", in
+7.3, not in 7.2.y) tests the link's FRL rate instead.
+  0  7.2.3: connector_signal == HDMI_FRL (never true)
+  1  df94112ceebf: frl_link_rate != 0
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index 38d0d5b..9a337a3 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -2006,6 +2006,11 @@ static int amdgpu_dm_init_power_module(struct amdgpu_display_manager *dm)
+ 	return 0;
+ }
+ 
++static int frl_status_poll_mode;
++module_param_named(dc_hpo_frl_status_poll_mode, frl_status_poll_mode, int, 0644);
++MODULE_PARM_DESC(dc_hpo_frl_status_poll_mode,
++		 "HDMI FRL status polling: 0 as 7.2.3 (never polls), 1 as upstream df94112ceebf (polls a link with an FRL rate)");
++
+ static void hdmi_frl_status_polling_work(struct work_struct *work)
+ {
+ 	struct amdgpu_display_manager *dm =
+@@ -2024,7 +2029,10 @@ static void hdmi_frl_status_polling_work(struct work_struct *work)
+ 		if (!dc_is_hdmi_signal(dc_link->connector_signal))
+ 			continue;
+ 
+-		if (dc_link->connector_signal != SIGNAL_TYPE_HDMI_FRL)
++		if (frl_status_poll_mode == 1) {
++			if (dc_link->frl_link_settings.frl_link_rate == 0)
++				continue;
++		} else if (dc_link->connector_signal != SIGNAL_TYPE_HDMI_FRL)
+ 			continue;
+ 
+ 		link_update = dc_link_frl_poll_status_flag(dc_link);

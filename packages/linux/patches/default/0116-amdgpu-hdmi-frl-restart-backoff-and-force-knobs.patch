@@ -1,0 +1,60 @@
+link_hdmi_frl.c, above `static int frl_restart_backoff_ms;`:
+Test knobs (cinemaONE, 2026-09-27), for dc_hpo_frl_retrain_in_place=2 only.
+Through the VRROOM a restart was asked for again ~0.4 s after the one before
+(LTP 5,6,7,8 every time), up to 17 times before it settled.
+  dc_hpo_frl_restart_backoff_ms: after a restart, leave a new FLT_Update
+    unserved (and set) for this long; 0 = serve at once
+  dc_hpo_frl_force_restart: write 1 and the next poll round restarts the
+    streams once, as if asked (for timing page flips across a restart)
+Every restart is logged at KERN_INFO, whatever drm.debug says.
+
+diff --git a/drivers/gpu/drm/amd/display/dc/link/protocols/link_hdmi_frl.c b/drivers/gpu/drm/amd/display/dc/link/protocols/link_hdmi_frl.c
+index 40ec623..5e62e12 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/protocols/link_hdmi_frl.c
++++ b/drivers/gpu/drm/amd/display/dc/link/protocols/link_hdmi_frl.c
+@@ -66,6 +66,16 @@ bool hdmi_frl_ltsp_retrain_enabled(void)
+ 
+ static int frl_retrain_in_place;
+ module_param_named(dc_hpo_frl_retrain_in_place, frl_retrain_in_place, int, 0644);
++
++static int frl_restart_backoff_ms;
++module_param_named(dc_hpo_frl_restart_backoff_ms, frl_restart_backoff_ms, int, 0644);
++MODULE_PARM_DESC(dc_hpo_frl_restart_backoff_ms,
++		 "HDMI FRL status poll, restart mode: ms after a restart before a new FLT_Update is served (default 0)");
++static int frl_force_restart;
++module_param_named(dc_hpo_frl_force_restart, frl_force_restart, int, 0644);
++MODULE_PARM_DESC(dc_hpo_frl_force_restart,
++		 "HDMI FRL status poll, restart mode: write 1 to restart the streams once at the next poll round");
++static unsigned long frl_last_restart;
+ MODULE_PARM_DESC(dc_hpo_frl_retrain_in_place,
+ 		 "HDMI FRL status poll: 0 retrain then RETRAIN detect (upstream), 1 retrain then LTS:P in place, 2 streams off and on again; no detect for 1 and 2");
+ 
+@@ -262,6 +272,17 @@ bool hdmi_frl_poll_status_flag(struct dc_link *link)
+ 		/* cinemaONE test: a late FRL_Start is only acknowledged; count them */
+ 		FRL_INFO("FRL STATUS POLL:  FRL_START = 1 while streaming, cleared\n");
+ 	}
++	if (frl_retrain_in_place == 2 && READ_ONCE(frl_force_restart)) {
++		WRITE_ONCE(frl_force_restart, 0);
++		pr_info("amdgpu: cinemaONE FRL status poll: forced stream restart\n");
++		link_restart_all_streams_for_link(link);
++		frl_last_restart = jiffies;
++		return false;
++	}
++	if (scdc_update.fields.FLT_UPDATE && frl_retrain_in_place == 2 &&
++	    frl_restart_backoff_ms > 0 && frl_last_restart != 0 &&
++	    time_before(jiffies, frl_last_restart + msecs_to_jiffies(frl_restart_backoff_ms)))
++		return false; /* cinemaONE test: back off; FLT_Update stays set */
+ 	if (scdc_update.fields.FLT_UPDATE) {
+ 		offset = HDMI_SCDC_LTP_REQ;
+ 
+@@ -323,7 +344,10 @@ bool hdmi_frl_poll_status_flag(struct dc_link *link)
+ 						ln0_pattern, ln1_pattern, ln2_pattern, ln3_pattern);
+ 				hdmi_frl_LTS_clear_Update_flag(link->ddc);
+ 				link_restart_all_streams_for_link(link);
++				frl_last_restart = jiffies;
+ 				FRL_INFO("FRL STATUS POLL:  streams restarted\n");
++				pr_info("amdgpu: cinemaONE FRL status poll: FLT_Update (LTP %d %d %d %d), streams restarted\n",
++					ln0_pattern, ln1_pattern, ln2_pattern, ln3_pattern);
+ 			} else if (!flt_no_timeout) {
+ 				enum link_result trained;
+ 

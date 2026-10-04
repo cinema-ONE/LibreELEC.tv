@@ -1,0 +1,213 @@
+link_detection.c, above `static int frl_verify_restore;`:
+cinemaONE test knob (2026-09-27, plan J's J021): the destructive HDMI FRL
+verification turns the link's streams off (dpms) and nothing turns them back
+on when the sink did not change, since amdgpu_dm re-commits only for a new
+sink. 1 = remember the streams that were on, and after the verification turn
+them back on if the verified rate still carries the rate they ran at.
+0 = upstream.
+
+link_detection.c, above `bool same_sink = streams[0]->sink == link->local_sink;`:
+FRL streams only (a TMDS stream stays off, as upstream), and
+only toward the same sink: a changed sink gets amdgpu_dm's
+forced commit instead.
+
+link_dpms.c, above `void link_set_streams_dpms_on_for_link(struct dc_link *link,`:
+cinemaONE test (dc_hpo_frl_verify_restore=1, 2026-09-27): turn back on the
+streams a destructive link verification turned off -- the second half of
+link_restart_all_streams_for_link() -- each only while it is still in the
+current state on this link with dpms off.
+
+link_hdmi_frl.c, above `static bool frl_said_rate_down;`:
+The restart's two gates (cinemaONE, 2026-09-27, plan J's J021), neither
+counted by the cap, each said once until the next link enable:
+ - LTP 0xF on a lane asks for a lower FRL rate, which a restart at the same
+   rate cannot give: not served;
+ - with no stream on the link (a destructive verification turned it off),
+   there is nothing to restart: left to hotplug and userspace.
+
+diff --git a/drivers/gpu/drm/amd/display/dc/link/link_detection.c b/drivers/gpu/drm/amd/display/dc/link/link_detection.c
+index 4895b98..4680023 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/link_detection.c
++++ b/drivers/gpu/drm/amd/display/dc/link/link_detection.c
+@@ -48,6 +48,7 @@
+ #include "link_enc_cfg.h"
+ #include "dm_helpers.h"
+ #include "clk_mgr.h"
++#include <linux/moduleparam.h>
+ 
+  // Offset DPCD 050Eh == 0x5A
+ #define MST_HUB_ID_0x5A  0x5A
+@@ -836,6 +837,11 @@ static void restore_phy_clocks_for_destructive_link_verification(const struct dc
+ 	clk_mgr_optimize_pwr_state(dc, dc->clk_mgr);
+ }
+ 
++static int frl_verify_restore;
++module_param_named(dc_hpo_frl_verify_restore, frl_verify_restore, int, 0644);
++MODULE_PARM_DESC(dc_hpo_frl_verify_restore,
++		 "HDMI FRL: turn streams back on after a destructive link verification (1), or leave them off (0, upstream)");
++
+ static void verify_link_capability_destructive(struct dc_link *link,
+ 		enum dc_detect_reason reason)
+ {
+@@ -854,10 +860,45 @@ static void verify_link_capability_destructive(struct dc_link *link,
+ 				LINK_TRAINING_MAX_VERIFY_RETRY);
+ 	} else if (dc_is_hdmi_signal(link->local_sink->sink_signal)) {
+ 		if (!is_hdmi_frl_in_use(link)) {
++			struct pipe_ctx *pipes[MAX_PIPES];
++			struct dc_stream_state *streams[MAX_PIPES];
++			uint8_t count = 0;
++			int rate_before = link->frl_link_settings.frl_link_rate;
++			int i;
++
++			if (frl_verify_restore) {
++				link_get_master_pipes_with_dpms_on(link, link->dc->current_state, &count, pipes);
++				for (i = 0; i < count; i++) {
++					streams[i] = pipes[i]->stream;
++					dc_stream_retain(streams[i]);
++				}
++			}
+ 			link_set_all_streams_dpms_off_for_link(link);
+ 			hdmi_frl_verify_link_cap(link, &link->frl_reported_link_cap);
+ 			link->local_sink->sink_signal = (link->frl_verified_link_cap.frl_link_rate != HDMI_FRL_LINK_RATE_DISABLE)
+ 												? SIGNAL_TYPE_HDMI_FRL : SIGNAL_TYPE_HDMI_TYPE_A;
++			if (count) {
++				int verified = link->frl_verified_link_cap.frl_link_rate;
++				bool same_sink = streams[0]->sink == link->local_sink;
++				bool carries = rate_before != HDMI_FRL_LINK_RATE_DISABLE &&
++						verified != HDMI_FRL_LINK_RATE_DISABLE && verified >= rate_before &&
++						same_sink;
++
++				pr_info("amdgpu: cinemaONE destructive verify: %d stream(s) were on at rate %d, verified rate %d, stream sink %p, local sink %p: %s\n",
++					count, rate_before, verified, streams[0]->sink, link->local_sink,
++					carries ? "turning them back on" : "left off");
++				if (carries) {
++					struct dc_stream_state *restore[MAX_PIPES];
++					uint8_t n = 0;
++
++					for (i = 0; i < count; i++)
++						if (streams[i]->sink == link->local_sink)
++							restore[n++] = streams[i];
++					link_set_streams_dpms_on_for_link(link, restore, n);
++				}
++				for (i = 0; i < count; i++)
++					dc_stream_release(streams[i]);
++			}
+ 		} else {
+ 			link->local_sink->sink_signal = SIGNAL_TYPE_HDMI_TYPE_A;
+ 			link->frl_verified_link_cap.frl_link_rate = HDMI_FRL_LINK_RATE_DISABLE;
+diff --git a/drivers/gpu/drm/amd/display/dc/link/link_dpms.c b/drivers/gpu/drm/amd/display/dc/link/link_dpms.c
+index 2625bf1..12f4dac 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/link_dpms.c
++++ b/drivers/gpu/drm/amd/display/dc/link/link_dpms.c
+@@ -221,6 +221,37 @@ void link_restart_all_streams_for_link(struct dc_link *link)
+ 	}
+ }
+ 
++static bool is_master_pipe_for_link(const struct dc_link *link,
++		const struct pipe_ctx *pipe);
++
++void link_set_streams_dpms_on_for_link(struct dc_link *link,
++		struct dc_stream_state *streams[], uint8_t count)
++{
++	struct dc_stream_update stream_update;
++	bool dpms_off = false;
++	int i, j;
++
++	memset(&stream_update, 0, sizeof(stream_update));
++	stream_update.dpms_off = &dpms_off;
++
++	for (i = 0; i < count; i++) {
++		bool off_here = false;
++
++		for (j = 0; j < MAX_PIPES; j++) {
++			struct pipe_ctx *pipe = &link->dc->current_state->res_ctx.pipe_ctx[j];
++
++			if (pipe->stream == streams[i] && is_master_pipe_for_link(link, pipe))
++				off_here = streams[i]->dpms_off;
++		}
++		if (!off_here)
++			continue;
++		stream_update.stream = streams[i];
++		dc_commit_updates_for_stream(link->ctx->dc, NULL, 0,
++				streams[i], &stream_update,
++				link->dc->current_state);
++	}
++}
++
+ void link_resume(struct dc_link *link)
+ {
+ 	if (link->connector_signal != SIGNAL_TYPE_VIRTUAL)
+diff --git a/drivers/gpu/drm/amd/display/dc/link/link_dpms.h b/drivers/gpu/drm/amd/display/dc/link/link_dpms.h
+index 578e8c1..e631cb3 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/link_dpms.h
++++ b/drivers/gpu/drm/amd/display/dc/link/link_dpms.h
+@@ -37,6 +37,8 @@ void link_blank_all_edp_displays(struct dc *dc);
+ void link_blank_dp_stream(struct dc_link *link, bool hw_init);
+ void link_set_all_streams_dpms_off_for_link(struct dc_link *link);
+ void link_restart_all_streams_for_link(struct dc_link *link);
++void link_set_streams_dpms_on_for_link(struct dc_link *link,
++		struct dc_stream_state *streams[], uint8_t count);
+ void link_get_master_pipes_with_dpms_on(const struct dc_link *link,
+ 		struct dc_state *state,
+ 		uint8_t *count,
+diff --git a/drivers/gpu/drm/amd/display/dc/link/protocols/link_hdmi_frl.c b/drivers/gpu/drm/amd/display/dc/link/protocols/link_hdmi_frl.c
+index 4c9c20d..be477c1 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/protocols/link_hdmi_frl.c
++++ b/drivers/gpu/drm/amd/display/dc/link/protocols/link_hdmi_frl.c
+@@ -90,6 +90,18 @@ static int frl_cap_count;
+ static bool frl_capped;
+ static bool frl_in_restart;
+ 
++static bool frl_said_rate_down;
++static bool frl_said_no_stream;
++
++static bool frl_link_has_stream_on(struct dc_link *link)
++{
++	struct pipe_ctx *pipes[MAX_PIPES];
++	uint8_t count;
++
++	link_get_master_pipes_with_dpms_on(link, link->dc->current_state, &count, pipes);
++	return count > 0;
++}
++
+ /* One more restart, or none: the cap's verdict, counted when it says yes. */
+ static bool frl_restart_allowed(void)
+ {
+@@ -339,7 +351,27 @@ bool hdmi_frl_poll_status_flag(struct dc_link *link)
+ 		ln2_pattern = ltp_req.fields.LN2_LTP_REQ;
+ 		ln3_pattern = ltp_req.fields.LN3_LTP_REQ;
+ 
+-		/* cinemaONE: the cap, before the encoder is sent any pattern */
++		/* cinemaONE: the gates, then the cap, before the encoder is sent any pattern */
++		if (frl_retrain_in_place == 2 && !flt_no_timeout) {
++			if (ln0_pattern == 0x0F || ln1_pattern == 0x0F ||
++			    ln2_pattern == 0x0F || ln3_pattern == 0x0F) {
++				if (!frl_said_rate_down)
++					pr_info("amdgpu: cinemaONE FRL status poll: FLT_Update asks for a lower rate (LTP %d %d %d %d); not served\n",
++						ln0_pattern, ln1_pattern, ln2_pattern, ln3_pattern);
++				frl_said_rate_down = true;
++				return false; /* FLT_Update stays set */
++			}
++			if (ln0_pattern != 0x0E && ln1_pattern != 0x0E &&
++			    ln2_pattern != 0x0E && ln3_pattern != 0x0E &&
++			    !frl_link_has_stream_on(link)) {
++				if (!frl_said_no_stream)
++					pr_info("amdgpu: cinemaONE FRL status poll: FLT_Update (LTP %d %d %d %d) with no stream on; left to hotplug and userspace\n",
++						ln0_pattern, ln1_pattern, ln2_pattern, ln3_pattern);
++				frl_said_no_stream = true;
++				return false; /* FLT_Update stays set */
++			}
++		}
++		/* cinemaONE: the cap */
+ 		if (frl_retrain_in_place == 2 && !flt_no_timeout &&
+ 		    ln0_pattern != 0x0E && ln1_pattern != 0x0E &&
+ 		    ln2_pattern != 0x0E && ln3_pattern != 0x0E &&
+@@ -477,6 +509,8 @@ bool hdmi_frl_poll_start(struct ddc_service *ddc_service)
+ 			pr_info("amdgpu: cinemaONE FRL status poll: cap cleared by a new link enable\n");
+ 		frl_capped = false;
+ 		frl_cap_count = 0;
++		frl_said_rate_down = false;
++		frl_said_no_stream = false;
+ 	}
+ 
+ 	/*Test Condition - FLT_no_timeout avoid link training*/

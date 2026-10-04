@@ -1,0 +1,86 @@
+link_hdmi_frl.c, above `static int frl_start_polls = 100;`:
+Test knob (cinemaONE, 2026-09-26): how many times LTS:P polls the sink's
+FRL_Start, 2 ms apart, before enabling FRL video anyway. Upstream polls 100
+times ("poll for 200ms") and then goes on silently. With a JVC NZ9 cabled
+straight to an RX 7600, every dark 8K light from 1080p had spent the whole
+budget without FRL_Start (308-315 ms, 6 of 6) and every lit one saw it
+within ~30 polls (8 of 8); twenty seconds later the sink still had FRL_Start
+set and every character error counter saturated.
+  100   upstream
+  N     poll N times (at most 5000, about 10 s)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/link/protocols/link_hdmi_frl.c b/drivers/gpu/drm/amd/display/dc/link/protocols/link_hdmi_frl.c
+index c350741..1d3e8c9 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/protocols/link_hdmi_frl.c
++++ b/drivers/gpu/drm/amd/display/dc/link/protocols/link_hdmi_frl.c
+@@ -43,6 +43,13 @@
+ 
+ #include "dml/dml1_frl_cap_chk.h"
+ 
++#include <linux/moduleparam.h>
++
++static int frl_start_polls = 100;
++module_param_named(dc_hpo_frl_start_polls, frl_start_polls, int, 0644);
++MODULE_PARM_DESC(dc_hpo_frl_start_polls,
++		 "HDMI FRL LTS:P: FRL_Start polls, 2 ms apart, before enabling video anyway (default 100)");
++
+ #define DC_LOGGER \
+ 	dc_logger
+ #define DC_LOGGER_INIT(logger) \
+@@ -211,6 +218,8 @@ bool hdmi_frl_poll_status_flag(struct dc_link *link)
+ 	bool flt_no_timeout = false;
+ 	bool link_update = false;
+ 
++	DC_LOGGER_INIT(link->ctx->logger);
++
+ 	/*Test Condition - FLT_no_timeout avoid link training*/
+ 	offset = HDMI_SCDC_SOURCE_TEST_REQ;
+ 	link_query_ddc_data(link->ddc, slave_address, &offset,
+@@ -231,6 +240,8 @@ bool hdmi_frl_poll_status_flag(struct dc_link *link)
+ 		write_buffer[1] = (scdc_update.fields.FRL_START << 4);
+ 		link_query_ddc_data(link->ddc, slave_address,
+ 				write_buffer, sizeof(write_buffer), NULL, 0);
++		/* cinemaONE test: a late FRL_Start is only acknowledged; count them */
++		FRL_INFO("FRL STATUS POLL:  FRL_START = 1 while streaming, cleared\n");
+ 	}
+ 	if (scdc_update.fields.FLT_UPDATE) {
+ 		offset = HDMI_SCDC_LTP_REQ;
+@@ -339,9 +350,12 @@ void hdmi_frl_poll_start(struct ddc_service *ddc_service)
+ 	uint8_t write_buffer[2] = {0};
+ 	union hdmi_scdc_source_test_req test_req = {0};
+ 	union hdmi_scdc_update_read_data scdc_update = {0};
+-	uint16_t num_polls = 100;
++	uint16_t num_polls = frl_start_polls < 1 ? 100 : (frl_start_polls > 5000 ? 5000 : frl_start_polls);
++	uint16_t budget = num_polls;
+ 	uint16_t wait_time = 2000;
+ 	bool flt_no_timeout = false;
++	bool frl_start = false;
++	bool flt_update = false;
+ 
+ 	DC_LOGGER_INIT(ddc_service->link->ctx->logger);
+ 
+@@ -372,6 +386,7 @@ void hdmi_frl_poll_start(struct ddc_service *ddc_service)
+ 			write_buffer[1] = (scdc_update.fields.FRL_START << 4);
+ 			link_query_ddc_data(ddc_service, slave_address,
+ 					write_buffer, sizeof(write_buffer), NULL, 0);
++			frl_start = true;
+ 			break;
+ 		}
+ 		if (scdc_update.fields.FLT_UPDATE == 1) {
+@@ -380,9 +395,16 @@ void hdmi_frl_poll_start(struct ddc_service *ddc_service)
+ 			write_buffer[1] = (scdc_update.fields.FLT_UPDATE << 5);
+ 			link_query_ddc_data(ddc_service, slave_address,
+ 					write_buffer, sizeof(write_buffer), NULL, 0);
++			flt_update = true;
+ 			break;
+ 		}
+ 	}
++	if (flt_update)
++		FRL_INFO("FRL LINK TRAINING:  LTS:P FLT_UPDATE before FRL_START, after %d of %d polls\n",
++				budget - num_polls + 1, budget);
++	else if (!frl_start)
++		FRL_INFO("FRL LINK TRAINING:  LTS:P no FRL_START after %d polls; enabling video anyway\n",
++				budget);
+ 	return;
+ }
+ 

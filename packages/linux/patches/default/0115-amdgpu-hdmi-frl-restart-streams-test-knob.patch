@@ -1,0 +1,96 @@
+link_dpms.c, above `void link_restart_all_streams_for_link(struct dc_link *link)`:
+cinemaONE test (dc_hpo_frl_retrain_in_place=2, 2026-09-27): every stream on
+the link off and on again through stream updates, as
+link_set_all_streams_dpms_off_for_link() does for the first half. The "on"
+runs the normal enable path -- link training, LTS:P waiting for FRL_Start,
+then the stream -- without a mode set of the timing generator.
+
+link_hdmi_frl.c, above `static int frl_retrain_in_place;`:
+  2  every stream on the link off and on again (stream updates with
+     dpms_off), whose "on" trains the link and waits for FRL_Start before
+     the stream starts; no training of its own, no detect. With 1 the
+     VRROOM never set FRL_Start while the stream kept sending video.
+
+diff --git a/drivers/gpu/drm/amd/display/dc/link/link_dpms.c b/drivers/gpu/drm/amd/display/dc/link/link_dpms.c
+index 76fffe0..2625bf1 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/link_dpms.c
++++ b/drivers/gpu/drm/amd/display/dc/link/link_dpms.c
+@@ -190,6 +190,37 @@ void link_set_all_streams_dpms_off_for_link(struct dc_link *link)
+ 		dp_disable_link_phy(link, &link_res, link->connector_signal);
+ }
+ 
++void link_restart_all_streams_for_link(struct dc_link *link)
++{
++	struct pipe_ctx *pipes[MAX_PIPES];
++	struct dc_stream_state *streams[MAX_PIPES];
++	uint8_t count;
++	int i;
++	struct dc_stream_update stream_update;
++	bool dpms_off = true;
++
++	memset(&stream_update, 0, sizeof(stream_update));
++	stream_update.dpms_off = &dpms_off;
++
++	link_get_master_pipes_with_dpms_on(link, link->dc->current_state, &count, pipes);
++	for (i = 0; i < count; i++)
++		streams[i] = pipes[i]->stream;
++
++	for (i = 0; i < count; i++) {
++		stream_update.stream = streams[i];
++		dc_commit_updates_for_stream(link->ctx->dc, NULL, 0,
++				streams[i], &stream_update,
++				link->dc->current_state);
++	}
++	dpms_off = false;
++	for (i = 0; i < count; i++) {
++		stream_update.stream = streams[i];
++		dc_commit_updates_for_stream(link->ctx->dc, NULL, 0,
++				streams[i], &stream_update,
++				link->dc->current_state);
++	}
++}
++
+ void link_resume(struct dc_link *link)
+ {
+ 	if (link->connector_signal != SIGNAL_TYPE_VIRTUAL)
+diff --git a/drivers/gpu/drm/amd/display/dc/link/link_dpms.h b/drivers/gpu/drm/amd/display/dc/link/link_dpms.h
+index e866214..578e8c1 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/link_dpms.h
++++ b/drivers/gpu/drm/amd/display/dc/link/link_dpms.h
+@@ -36,6 +36,7 @@ void link_blank_all_dp_displays(struct dc *dc);
+ void link_blank_all_edp_displays(struct dc *dc);
+ void link_blank_dp_stream(struct dc_link *link, bool hw_init);
+ void link_set_all_streams_dpms_off_for_link(struct dc_link *link);
++void link_restart_all_streams_for_link(struct dc_link *link);
+ void link_get_master_pipes_with_dpms_on(const struct dc_link *link,
+ 		struct dc_state *state,
+ 		uint8_t *count,
+diff --git a/drivers/gpu/drm/amd/display/dc/link/protocols/link_hdmi_frl.c b/drivers/gpu/drm/amd/display/dc/link/protocols/link_hdmi_frl.c
+index 1b75a64..40ec623 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/protocols/link_hdmi_frl.c
++++ b/drivers/gpu/drm/amd/display/dc/link/protocols/link_hdmi_frl.c
+@@ -67,7 +67,7 @@ bool hdmi_frl_ltsp_retrain_enabled(void)
+ static int frl_retrain_in_place;
+ module_param_named(dc_hpo_frl_retrain_in_place, frl_retrain_in_place, int, 0644);
+ MODULE_PARM_DESC(dc_hpo_frl_retrain_in_place,
+-		 "HDMI FRL status poll: 0 retrain then RETRAIN detect (upstream), 1 retrain then LTS:P in place, no detect");
++		 "HDMI FRL status poll: 0 retrain then RETRAIN detect (upstream), 1 retrain then LTS:P in place, 2 streams off and on again; no detect for 1 and 2");
+ 
+ #define DC_LOGGER \
+ 	dc_logger
+@@ -317,7 +317,14 @@ bool hdmi_frl_poll_status_flag(struct dc_link *link)
+ 						&link->frl_link_settings);
+ 			}
+ 		} else
+-			if (!flt_no_timeout) {
++			if (!flt_no_timeout && frl_retrain_in_place == 2) {
++				/* cinemaONE test: restart the streams; their "on" trains */
++				FRL_INFO("FRL STATUS POLL:  FLT_UPDATE (LTP %d %d %d %d): streams off and on again\n",
++						ln0_pattern, ln1_pattern, ln2_pattern, ln3_pattern);
++				hdmi_frl_LTS_clear_Update_flag(link->ddc);
++				link_restart_all_streams_for_link(link);
++				FRL_INFO("FRL STATUS POLL:  streams restarted\n");
++			} else if (!flt_no_timeout) {
+ 				enum link_result trained;
+ 
+ 				hdmi_frl_LTS_clear_Link_Setting(link->ddc);

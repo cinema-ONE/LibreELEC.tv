@@ -1,0 +1,115 @@
+link_hdmi_frl.c, above `static int frl_restart_cap = 30;`:
+Safety cap (cinemaONE, 2026-09-27), for dc_hpo_frl_retrain_in_place=2: a
+sink that never settles would have its streams restarted forever. Through
+the VRROOM the longest run of requests was 17 restarts in 5.7 s.
+  dc_hpo_frl_restart_cap: after this many restarts within
+    dc_hpo_frl_restart_cap_ms, serve no more FLT_Update (it stays set, the
+    encoder untouched) until the next link enable that is not one of these
+    restarts -- the next mode set -- and say so once; 0 = no cap
+Forced restarts (dc_hpo_frl_force_restart) are not counted.
+
+diff --git a/drivers/gpu/drm/amd/display/dc/link/protocols/link_hdmi_frl.c b/drivers/gpu/drm/amd/display/dc/link/protocols/link_hdmi_frl.c
+index 5e62e12..4c9c20d 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/protocols/link_hdmi_frl.c
++++ b/drivers/gpu/drm/amd/display/dc/link/protocols/link_hdmi_frl.c
+@@ -76,6 +76,51 @@ module_param_named(dc_hpo_frl_force_restart, frl_force_restart, int, 0644);
+ MODULE_PARM_DESC(dc_hpo_frl_force_restart,
+ 		 "HDMI FRL status poll, restart mode: write 1 to restart the streams once at the next poll round");
+ static unsigned long frl_last_restart;
++
++static int frl_restart_cap = 30;
++module_param_named(dc_hpo_frl_restart_cap, frl_restart_cap, int, 0644);
++MODULE_PARM_DESC(dc_hpo_frl_restart_cap,
++		 "HDMI FRL status poll, restart mode: stop after this many restarts within dc_hpo_frl_restart_cap_ms until the next mode set (default 30, 0 = no cap)");
++static int frl_restart_cap_ms = 20000;
++module_param_named(dc_hpo_frl_restart_cap_ms, frl_restart_cap_ms, int, 0644);
++MODULE_PARM_DESC(dc_hpo_frl_restart_cap_ms,
++		 "HDMI FRL status poll, restart mode: the cap's window in ms (default 20000)");
++static unsigned long frl_cap_window_start;
++static int frl_cap_count;
++static bool frl_capped;
++static bool frl_in_restart;
++
++/* One more restart, or none: the cap's verdict, counted when it says yes. */
++static bool frl_restart_allowed(void)
++{
++	unsigned long now = jiffies;
++
++	if (frl_capped)
++		return false;
++	if (frl_restart_cap <= 0)
++		return true;
++	if (frl_cap_count == 0 ||
++	    time_after(now, frl_cap_window_start + msecs_to_jiffies(frl_restart_cap_ms))) {
++		frl_cap_window_start = now;
++		frl_cap_count = 0;
++	}
++	if (frl_cap_count >= frl_restart_cap) {
++		frl_capped = true;
++		pr_info("amdgpu: cinemaONE FRL status poll: %d restarts in %u ms, the cap; no more until the next mode set\n",
++			frl_cap_count, jiffies_to_msecs(now - frl_cap_window_start));
++		return false;
++	}
++	frl_cap_count++;
++	return true;
++}
++
++static void frl_restart_streams(struct dc_link *link)
++{
++	frl_in_restart = true;
++	link_restart_all_streams_for_link(link);
++	frl_in_restart = false;
++	frl_last_restart = jiffies;
++}
+ MODULE_PARM_DESC(dc_hpo_frl_retrain_in_place,
+ 		 "HDMI FRL status poll: 0 retrain then RETRAIN detect (upstream), 1 retrain then LTS:P in place, 2 streams off and on again; no detect for 1 and 2");
+ 
+@@ -275,8 +320,7 @@ bool hdmi_frl_poll_status_flag(struct dc_link *link)
+ 	if (frl_retrain_in_place == 2 && READ_ONCE(frl_force_restart)) {
+ 		WRITE_ONCE(frl_force_restart, 0);
+ 		pr_info("amdgpu: cinemaONE FRL status poll: forced stream restart\n");
+-		link_restart_all_streams_for_link(link);
+-		frl_last_restart = jiffies;
++		frl_restart_streams(link);
+ 		return false;
+ 	}
+ 	if (scdc_update.fields.FLT_UPDATE && frl_retrain_in_place == 2 &&
+@@ -295,6 +339,13 @@ bool hdmi_frl_poll_status_flag(struct dc_link *link)
+ 		ln2_pattern = ltp_req.fields.LN2_LTP_REQ;
+ 		ln3_pattern = ltp_req.fields.LN3_LTP_REQ;
+ 
++		/* cinemaONE: the cap, before the encoder is sent any pattern */
++		if (frl_retrain_in_place == 2 && !flt_no_timeout &&
++		    ln0_pattern != 0x0E && ln1_pattern != 0x0E &&
++		    ln2_pattern != 0x0E && ln3_pattern != 0x0E &&
++		    !frl_restart_allowed())
++			return false; /* capped: FLT_Update stays set */
++
+ 		if (ln0_pattern == 0x03 || ln1_pattern == 0x03 ||
+ 				ln2_pattern == 0x03 || ln3_pattern == 0x03) {
+ 			if (flt_no_timeout) {
+@@ -343,8 +394,7 @@ bool hdmi_frl_poll_status_flag(struct dc_link *link)
+ 				FRL_INFO("FRL STATUS POLL:  FLT_UPDATE (LTP %d %d %d %d): streams off and on again\n",
+ 						ln0_pattern, ln1_pattern, ln2_pattern, ln3_pattern);
+ 				hdmi_frl_LTS_clear_Update_flag(link->ddc);
+-				link_restart_all_streams_for_link(link);
+-				frl_last_restart = jiffies;
++				frl_restart_streams(link);
+ 				FRL_INFO("FRL STATUS POLL:  streams restarted\n");
+ 				pr_info("amdgpu: cinemaONE FRL status poll: FLT_Update (LTP %d %d %d %d), streams restarted\n",
+ 					ln0_pattern, ln1_pattern, ln2_pattern, ln3_pattern);
+@@ -421,6 +471,14 @@ bool hdmi_frl_poll_start(struct ddc_service *ddc_service)
+ 
+ 	DC_LOGGER_INIT(ddc_service->link->ctx->logger);
+ 
++	/* cinemaONE: a link enable of anyone's but the poll's restart clears the cap */
++	if (!frl_in_restart) {
++		if (frl_capped)
++			pr_info("amdgpu: cinemaONE FRL status poll: cap cleared by a new link enable\n");
++		frl_capped = false;
++		frl_cap_count = 0;
++	}
++
+ 	/*Test Condition - FLT_no_timeout avoid link training*/
+ 	offset = HDMI_SCDC_SOURCE_TEST_REQ;
+ 	link_query_ddc_data(ddc_service, slave_address, &offset,

@@ -1,0 +1,48 @@
+link_detection.c, above `static int frl_verify_skip_active;`:
+cinemaONE control knob (2026-09-27, for the report on c953b39f9487): 1 puts
+back the escape that commit removed (our 0106 is its backport) -- with
+dc->config.skip_frl_pretraining, a detect on a link whose stream is up and
+link_active is set verifies non-destructively. 0 = as upstream 7.3.
+
+diff --git a/drivers/gpu/drm/amd/display/dc/link/link_detection.c b/drivers/gpu/drm/amd/display/dc/link/link_detection.c
+index 4680023..1d12436 100644
+--- a/drivers/gpu/drm/amd/display/dc/link/link_detection.c
++++ b/drivers/gpu/drm/amd/display/dc/link/link_detection.c
+@@ -842,6 +842,11 @@ module_param_named(dc_hpo_frl_verify_restore, frl_verify_restore, int, 0644);
+ MODULE_PARM_DESC(dc_hpo_frl_verify_restore,
+ 		 "HDMI FRL: turn streams back on after a destructive link verification (1), or leave them off (0, upstream)");
+ 
++static int frl_verify_skip_active;
++module_param_named(dc_hpo_frl_verify_skip_active, frl_verify_skip_active, int, 0644);
++MODULE_PARM_DESC(dc_hpo_frl_verify_skip_active,
++		 "HDMI FRL: 1 = skip the destructive verification on an active link (7.2's escape, removed by c953b39f9487); 0 = upstream 7.3");
++
+ static void verify_link_capability_destructive(struct dc_link *link,
+ 		enum dc_detect_reason reason)
+ {
+@@ -968,8 +973,24 @@ static bool should_verify_link_capability_destructively(struct dc_link *link,
+ 				link->link_enc->features.flags.bits.IS_HDMI_FRL_CAPABLE &&
+ 				link->local_sink->edid_caps.max_frl_rate != 0) {
+ 		destrictive = true;
+-		if (is_hdmi_frl_in_use(link))
++		if (is_hdmi_frl_in_use(link)) {
+ 			destrictive = false;
++		} else if (frl_verify_skip_active && link->dc->config.skip_frl_pretraining) {
++			struct pipe_ctx *pipes = link->dc->current_state->res_ctx.pipe_ctx;
++			int i;
++
++			for (i = 0; i < MAX_PIPES; i++) {
++				if (pipes[i].stream != NULL &&
++					pipes[i].stream->link == link) {
++					/*If link is already active, skip PHY programming*/
++					if (link->link_status.link_active) {
++						destrictive = false;
++					}
++				}
++			}
++			if (!destrictive)
++				pr_info("amdgpu: cinemaONE verify: link active, 7.2's escape: non-destructive\n");
++		}
+ 	}
+ 
+ 	return destrictive;

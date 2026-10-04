@@ -1,0 +1,35 @@
+dcn30_hpo_frl_stream_encoder.c, above `static int hpo_frl_cvtem_new_mode;`:
+Test knob (cinemaONE, 2026-09-26): the New bit of the first DSC PPS CVTEM
+packet. Upstream writes packet 0 with New=1 and rewrites it with New=0 in the
+same call; both go through the double-buffered VPG before any block update,
+so New=1 probably never reaches the wire. On the NUC, 8K60 lit from a
+non-DSC mode 23 times of 23, but after an 8K60 DSC stream only 10 of 25: a
+sink that re-latches the PPS only on New=1 fits.
+  0  clear New after writing (upstream)
+  1  leave New=1 on packet 0
+
+diff --git a/drivers/gpu/drm/amd/display/dc/hpo/dcn30/dcn30_hpo_frl_stream_encoder.c b/drivers/gpu/drm/amd/display/dc/hpo/dcn30/dcn30_hpo_frl_stream_encoder.c
+index 5b768e6..acb3f57 100644
+--- a/drivers/gpu/drm/amd/display/dc/hpo/dcn30/dcn30_hpo_frl_stream_encoder.c
++++ b/drivers/gpu/drm/amd/display/dc/hpo/dcn30/dcn30_hpo_frl_stream_encoder.c
+@@ -39,6 +39,11 @@ module_param_named(dc_hpo_frl_packet_line_mode, hpo_frl_packet_line_mode, int, 0
+ MODULE_PARM_DESC(dc_hpo_frl_packet_line_mode,
+ 		 "HDMI FRL generic packet line: 0 all on 2 (default), 1 HDR on 3, 2 all but the DSC PPS on 3, 3 all on 3");
+ 
++static int hpo_frl_cvtem_new_mode;
++module_param_named(dc_hpo_frl_cvtem_new_mode, hpo_frl_cvtem_new_mode, int, 0644);
++MODULE_PARM_DESC(dc_hpo_frl_cvtem_new_mode,
++		 "HDMI FRL DSC CVTEM New bit: 0 cleared after writing (default), 1 kept set");
++
+ static uint32_t hpo_frl_packet_line(uint32_t packet_index)
+ {
+ 	switch (hpo_frl_packet_line_mode) {
+@@ -563,6 +568,8 @@ void hpo_enc3_hdmi_set_dsc_config(
+ 		hpo_enc3_update_hdmi_info_packet(enc3, 10, &emp_packet);
+ 
+ 		/* Packet 0 - Clear New[7] */
++		if (hpo_frl_cvtem_new_mode == 1)
++			return; /* test knob: leave New=1 on the wire */
+ 		emp_packet.valid = true;
+ 		emp_packet.hb0 = 0x7F; /* Default */
+ 		emp_packet.hb1 = (1 << 7); /* First */
