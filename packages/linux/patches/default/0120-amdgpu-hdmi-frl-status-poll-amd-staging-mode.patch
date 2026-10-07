@@ -1,0 +1,36 @@
+amdgpu_dm.c, above `static int frl_status_poll_mode;`:
+  3  amd-staging: 2, and a link that is not active is skipped
+     (9981a9b111fe + 495606b324cd, drm/amd#5897)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index ce07c8c..3635ea7 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -2009,7 +2009,7 @@ static int amdgpu_dm_init_power_module(struct amdgpu_display_manager *dm)
+ static int frl_status_poll_mode;
+ module_param_named(dc_hpo_frl_status_poll_mode, frl_status_poll_mode, int, 0644);
+ MODULE_PARM_DESC(dc_hpo_frl_status_poll_mode,
+-		 "HDMI FRL status polling: 0 as 7.2.3 (never polls), 1 as upstream df94112ceebf (polls a link with an FRL rate), 2 as 1 but never during a commit");
++		 "HDMI FRL status polling: 0 as 7.2.3 (never polls), 1 as upstream df94112ceebf (polls a link with an FRL rate), 2 as 1 but never during a commit, 3 as amd-staging (9981a9b111fe + 495606b324cd)");
+ 
+ static void hdmi_frl_status_polling_work(struct work_struct *work)
+ {
+@@ -2029,6 +2029,18 @@ static void hdmi_frl_status_polling_work(struct work_struct *work)
+ 		if (!dc_is_hdmi_signal(dc_link->connector_signal))
+ 			continue;
+ 
++		if (frl_status_poll_mode == 3) {
++			if (!mutex_trylock(&dm->dc_lock))
++				continue;
++			if (dc_link->frl_link_settings.frl_link_rate != 0 &&
++			    dc_link->link_status.link_active &&
++			    dc_link_frl_poll_status_flag(dc_link) &&
++			    !dc_link_detect(dc_link, DETECT_REASON_RETRAIN))
++				DRM_ERROR("HDMI FRL retrain failed\n");
++			mutex_unlock(&dm->dc_lock);
++			continue;
++		}
++
+ 		if (frl_status_poll_mode == 2) {
+ 			if (!mutex_trylock(&dm->dc_lock))
+ 				continue; /* a commit is running: not this round */
