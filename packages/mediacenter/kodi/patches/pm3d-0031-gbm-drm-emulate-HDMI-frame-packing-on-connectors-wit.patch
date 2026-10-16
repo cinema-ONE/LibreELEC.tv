@@ -1,0 +1,332 @@
+From ba0276030ee3b6dcf3e733fb64ae191a35ad6b88 Mon Sep 17 00:00:00 2001
+From: Adrien Sesio <aasesio@gmail.com>
+Date: Fri, 16 Oct 2026 12:35:35 -0400
+Subject: [PATCH] gbm/drm: emulate HDMI frame packing on connectors without
+ stereo modes
+
+The kernel only flags native HDMI connectors stereo_allowed, so a
+DisplayPort connector never carries 3D modes, even when its sink is an
+HDMI TV behind a DP-to-HDMI protocol converter. That is the HDMI port of
+many Intel boards (NUC7/NUC8 and others use a MegaChips or Parade LSPCON
+and show up as DP-1), where the frame-packing mode this branch relies on
+never appears.
+
+The raster itself is not the problem: scanning out the frame-packing
+picture (1080 + 45 + 1080 lines at twice the pixel clock, 1920x2205 @ 24 Hz)
+as a plain 2D mode makes an HDMI 1.4a TV switch into frame-packed 3D.
+Verified on an Intel NUC8i7BEH (Coffee Lake, LSPCON MC2800) through an
+Onkyo receiver into a Panasonic VT65 plasma: both eyes correct, one flip
+per vblank at 41.667 ms over several minutes.
+
+So, when a connected connector has no stereo mode at all but the sink's
+EDID advertises HDMI 3D (3D_present in the HDMI VSDB), CDRMConnector
+appends a frame-packing variant of each mandatory HDMI 1.4a frame-packing
+timing it finds (1080p24/23.98, 720p60/59.94, 720p50), marked
+DRM_MODE_TYPE_USERDEF. Everything downstream treats them as real
+frame-packing modes (iScreenHeight = vdisplay + vtotal, iBlanking,
+CRTC_H). Only at commit time, in CDRMAtomic and CDRMLegacy, is the mode
+translated to the doubled 2D raster the kernel can accept, using the same
+arithmetic as drm_mode_set_crtcinfo(CRTC_STEREO_DOUBLE).
+
+The kernel sends no HDMI Vendor-Specific InfoFrame in this case, so the
+TV has to recognise the 3D structure from the timing; the Panasonic does,
+other sinks may not. KODI_3D_EMULATE_FRAME_PACKING=0 disables the
+emulation.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ xbmc/windowing/gbm/drm/DRMAtomic.cpp    |   7 +-
+ xbmc/windowing/gbm/drm/DRMConnector.cpp | 148 ++++++++++++++++++++++++
+ xbmc/windowing/gbm/drm/DRMConnector.h   |  26 ++++-
+ xbmc/windowing/gbm/drm/DRMLegacy.cpp    |   5 +-
+ 4 files changed, 182 insertions(+), 4 deletions(-)
+
+diff --git a/xbmc/windowing/gbm/drm/DRMAtomic.cpp b/xbmc/windowing/gbm/drm/DRMAtomic.cpp
+index 246cabb186..3a5433cc8f 100644
+--- a/xbmc/windowing/gbm/drm/DRMAtomic.cpp
++++ b/xbmc/windowing/gbm/drm/DRMAtomic.cpp
+@@ -8,6 +8,8 @@
+ 
+ #include "DRMAtomic.h"
+ 
++#include "DRMConnector.h"
++
+ #include "ServiceBroker.h"
+ #include "application/ApplicationComponents.h"
+ #include "application/ApplicationPlayer.h"
+@@ -83,7 +85,10 @@ void CDRMAtomic::DrmAtomicCommit(int fb_id, int flags, bool rendered, bool video
+     if (!AddProperty(m_connector, "CRTC_ID", m_crtc->GetCrtcId()))
+       return;
+ 
+-    modeBlob = CDRMPropertyBlob(m_fd, m_mode, sizeof(*m_mode));
++    // An emulated frame-packing mode is committed as its doubled 2D raster: the
++    // kernel does not know the mode is stereo (CDRMConnector::ToScanoutMode).
++    drmModeModeInfo scanoutMode = CDRMConnector::ToScanoutMode(*m_mode);
++    modeBlob = CDRMPropertyBlob(m_fd, &scanoutMode, sizeof(scanoutMode));
+     if (!modeBlob.IsValid())
+       return;
+ 
+diff --git a/xbmc/windowing/gbm/drm/DRMConnector.cpp b/xbmc/windowing/gbm/drm/DRMConnector.cpp
+index 799b59b037..134207ba7d 100644
+--- a/xbmc/windowing/gbm/drm/DRMConnector.cpp
++++ b/xbmc/windowing/gbm/drm/DRMConnector.cpp
+@@ -12,7 +12,10 @@
+ #include "utils/log.h"
+ 
+ #include <algorithm>
++#include <cstdio>
++#include <cstdlib>
+ #include <map>
++#include <string_view>
+ 
+ using namespace KODI::WINDOWING::GBM;
+ 
+@@ -48,6 +51,73 @@ std::map<drmModeConnection, std::string> connectorStatusNames = {
+     {DRM_MODE_UNKNOWNCONNECTION, "unknown"},
+ };
+ 
++/*!
++ * \brief Does the sink's EDID say it accepts HDMI 1.4 3D video (3D_present in the
++ * HDMI Vendor-Specific Data Block)? The kernel parses this too, but only turns it into
++ * stereo modes on connectors flagged stereo_allowed, which DisplayPort never is.
++ */
++bool EdidAdvertisesHdmi3D(const std::vector<uint8_t>& edid)
++{
++  if (edid.size() < 256)
++    return false;
++
++  const size_t extensions = edid[126];
++  for (size_t ext = 1; ext <= extensions && (ext + 1) * 128 <= edid.size(); ext++)
++  {
++    const uint8_t* block = edid.data() + ext * 128;
++    if (block[0] != 0x02 || block[1] < 3) // CTA-861 extension, revision 3 or later
++      continue;
++
++    const size_t dtdStart = std::min<size_t>(block[2], 127);
++    size_t pos = 4;
++    while (pos < dtdStart)
++    {
++      const uint8_t tag = block[pos] >> 5;
++      const size_t len = block[pos] & 0x1f;
++      const uint8_t* body = block + pos + 1;
++      if (pos + 1 + len > dtdStart)
++        break;
++
++      // Vendor-Specific Data Block with the HDMI Licensing OUI 00-0C-03
++      if (tag == 3 && len >= 8 && body[0] == 0x03 && body[1] == 0x0c && body[2] == 0x00)
++      {
++        const uint8_t flags = body[7];
++        if (flags & 0x20) // HDMI_Video_present
++        {
++          size_t q = 8;
++          if (flags & 0x80) // Latency_Fields_Present
++            q += 2;
++          if (flags & 0x40) // I_Latency_Fields_Present
++            q += 2;
++          if (q < len && (body[q] & 0x80)) // 3D_present
++            return true;
++        }
++      }
++      pos += 1 + len;
++    }
++  }
++
++  return false;
++}
++
++// CTA-861 timings for which HDMI 1.4a (section 8.2.3) makes frame packing mandatory
++// on a 3D-capable sink: 1080p 23.98/24, 720p 59.94/60 and 720p 50 (VICs 32, 4 and 19).
++bool IsMandatoryFramePackingTiming(const drmModeModeInfo& mode)
++{
++  if (mode.flags & (DRM_MODE_FLAG_INTERLACE | DRM_MODE_FLAG_DBLSCAN | DRM_MODE_FLAG_3D_MASK))
++    return false;
++
++  if (mode.hdisplay == 1920 && mode.vdisplay == 1080 && mode.htotal == 2750 &&
++      mode.vtotal == 1125)
++    return mode.clock == 74250 || mode.clock == 74176;
++
++  if (mode.hdisplay == 1280 && mode.vdisplay == 720 && mode.vtotal == 750 &&
++      (mode.htotal == 1650 || mode.htotal == 1980))
++    return mode.clock == 74250 || mode.clock == 74176;
++
++  return false;
++}
++
+ } // namespace
+ 
+ CDRMConnector::CDRMConnector(int fd, uint32_t connector)
+@@ -59,6 +129,8 @@ CDRMConnector::CDRMConnector(int fd, uint32_t connector)
+   if (!GetProperties(m_connector->connector_id, DRM_MODE_OBJECT_CONNECTOR))
+     throw std::runtime_error("failed to get properties for connector: " +
+                              std::to_string(m_connector->connector_id));
++
++  UpdateModes();
+ }
+ 
+ bool CDRMConnector::CheckConnector()
+@@ -71,11 +143,87 @@ bool CDRMConnector::CheckConnector()
+     KODI::TIME::Sleep(1s);
+ 
+     m_connector.reset(drmModeGetConnector(m_fd, m_connector->connector_id));
++    UpdateModes();
+   }
+ 
+   return m_connector->connection == DRM_MODE_CONNECTED;
+ }
+ 
++void CDRMConnector::UpdateModes()
++{
++  m_modes.assign(m_connector->modes, m_connector->modes + m_connector->count_modes);
++
++  if (m_connector->connection == DRM_MODE_CONNECTED)
++    AddEmulatedFramePackingModes();
++}
++
++void CDRMConnector::AddEmulatedFramePackingModes()
++{
++  // An environment switch for bring-up and bug reports.
++  const char* env = std::getenv("KODI_3D_EMULATE_FRAME_PACKING");
++  if (env && std::string_view{env} == "0")
++    return;
++
++  // Native HDMI connectors get stereo modes from the kernel; only emulate when the
++  // kernel offers none at all for this connector.
++  const bool kernelHasStereo = std::any_of(m_modes.begin(), m_modes.end(), [](const auto& m) {
++    return (m.flags & DRM_MODE_FLAG_3D_MASK) != 0;
++  });
++  if (kernelHasStereo)
++    return;
++
++  if (!EdidAdvertisesHdmi3D(GetEDID()))
++    return;
++
++  std::vector<drmModeModeInfo> emulated;
++  for (const auto& mode : m_modes)
++  {
++    if (!IsMandatoryFramePackingTiming(mode))
++      continue;
++
++    drmModeModeInfo fp = mode;
++    fp.flags |= DRM_MODE_FLAG_3D_FRAME_PACKING;
++    fp.type = (fp.type & ~DRM_MODE_TYPE_PREFERRED) | DRM_MODE_TYPE_USERDEF;
++    emulated.push_back(fp);
++  }
++
++  if (emulated.empty())
++    return;
++
++  CLog::LogF(LOGINFO,
++             "connector {} offers no stereo modes but the sink advertises HDMI 3D: emulating "
++             "frame packing for {} timing(s) by scanning out the doubled raster as a 2D mode",
++             m_connector->connector_id, emulated.size());
++
++  m_modes.insert(m_modes.end(), emulated.begin(), emulated.end());
++}
++
++bool CDRMConnector::IsEmulatedFramePacking(const drmModeModeInfo& mode)
++{
++  return (mode.type & DRM_MODE_TYPE_USERDEF) &&
++         (mode.flags & DRM_MODE_FLAG_3D_MASK) == DRM_MODE_FLAG_3D_FRAME_PACKING;
++}
++
++drmModeModeInfo CDRMConnector::ToScanoutMode(const drmModeModeInfo& mode)
++{
++  drmModeModeInfo out = mode;
++  if (!IsEmulatedFramePacking(mode))
++    return out;
++
++  // Same arithmetic as drm_mode_set_crtcinfo() with CRTC_STEREO_DOUBLE: the picture
++  // becomes (vdisplay + vtotal) lines tall - left eye, active-space gap, right eye -
++  // at twice the pixel clock, so the refresh rate is unchanged.
++  out.clock = mode.clock * 2;
++  out.vdisplay = mode.vdisplay + mode.vtotal;
++  out.vsync_start = mode.vsync_start + mode.vtotal;
++  out.vsync_end = mode.vsync_end + mode.vtotal;
++  out.vtotal = mode.vtotal * 2;
++  out.flags &= ~DRM_MODE_FLAG_3D_MASK;
++  out.type &= ~DRM_MODE_TYPE_USERDEF;
++  snprintf(out.name, sizeof(out.name), "%ux%u", out.hdisplay, out.vdisplay);
++  return out;
++}
++
+ std::string CDRMConnector::GetType()
+ {
+   auto typeName = connectorTypeNames.find(m_connector->connector_type);
+diff --git a/xbmc/windowing/gbm/drm/DRMConnector.h b/xbmc/windowing/gbm/drm/DRMConnector.h
+index cde242d49f..9398d5e062 100644
+--- a/xbmc/windowing/gbm/drm/DRMConnector.h
++++ b/xbmc/windowing/gbm/drm/DRMConnector.h
+@@ -11,6 +11,7 @@
+ #include "DRMObject.h"
+ 
+ #include <string>
++#include <vector>
+ 
+ namespace KODI
+ {
+@@ -33,8 +34,24 @@ public:
+ 
+   uint32_t GetEncoderId() const { return m_connector->encoder_id; }
+   uint32_t* GetConnectorId() const { return &m_connector->connector_id; }
+-  int GetModesCount() const { return m_connector->count_modes; }
+-  drmModeModeInfoPtr GetModeForIndex(int index) const { return &m_connector->modes[index]; }
++  int GetModesCount() const { return static_cast<int>(m_modes.size()); }
++  drmModeModeInfoPtr GetModeForIndex(int index) { return &m_modes[index]; }
++
++  /*!
++   * \brief Whether a mode is a frame-packing mode this class synthesised because the
++   * kernel offers none on this connector (DisplayPort connectors, including the
++   * DP-to-HDMI converters that drive the HDMI port of many Intel boards, never carry
++   * stereo modes) although the sink's EDID advertises HDMI 3D.
++   */
++  static bool IsEmulatedFramePacking(const drmModeModeInfo& mode);
++
++  /*!
++   * \brief The timing to hand to the kernel for a mode: unchanged for a native mode,
++   * the doubled frame-packing raster (both eyes plus the active-space gap as one
++   * progressive picture, e.g. 1920x2205 @ 24 Hz) for an emulated frame-packing mode.
++   * Mirrors what drm_mode_set_crtcinfo(CRTC_STEREO_DOUBLE) computes for a real one.
++   */
++  static drmModeModeInfo ToScanoutMode(const drmModeModeInfo& mode);
+ 
+   bool IsConnected() { return m_connector->connection == DRM_MODE_CONNECTED; }
+   bool CheckConnector();
+@@ -42,6 +59,11 @@ public:
+   std::vector<uint8_t> GetEDID() const;
+ 
+ private:
++  void UpdateModes();
++  void AddEmulatedFramePackingModes();
++
++  std::vector<drmModeModeInfo> m_modes;
++
+   struct DrmModeConnectorDeleter
+   {
+     void operator()(drmModeConnector* p) { drmModeFreeConnector(p); }
+diff --git a/xbmc/windowing/gbm/drm/DRMLegacy.cpp b/xbmc/windowing/gbm/drm/DRMLegacy.cpp
+index 7b08af371d..abf71d02ef 100644
+--- a/xbmc/windowing/gbm/drm/DRMLegacy.cpp
++++ b/xbmc/windowing/gbm/drm/DRMLegacy.cpp
+@@ -8,6 +8,8 @@
+ 
+ #include "DRMLegacy.h"
+ 
++#include "DRMConnector.h"
++
+ #include "guilib/gui3d.h"
+ #include "settings/Settings.h"
+ #include "utils/log.h"
+@@ -31,8 +33,9 @@ bool CDRMLegacy::SetVideoMode(const RESOLUTION_INFO& res, struct gbm_bo* bo)
+ {
+   struct drm_fb* drm_fb = DrmFbGetFromBo(bo);
+ 
++  drmModeModeInfo scanoutMode = CDRMConnector::ToScanoutMode(*m_mode);
+   auto ret = drmModeSetCrtc(m_fd, m_crtc->GetCrtcId(), drm_fb->fb_id, 0, 0,
+-                            m_connector->GetConnectorId(), 1, m_mode);
++                            m_connector->GetConnectorId(), 1, &scanoutMode);
+ 
+   if (ret < 0)
+   {
+-- 
+2.56.0
+
