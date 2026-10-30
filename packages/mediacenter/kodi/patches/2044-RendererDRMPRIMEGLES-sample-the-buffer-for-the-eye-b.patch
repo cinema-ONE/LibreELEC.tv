@@ -1,0 +1,130 @@
+From abc73239222d200f595ebb39a6f542d7ade2e396 Mon Sep 17 00:00:00 2001
+From: Dom Cobley <popcornmix@gmail.com>
+Date: Sat, 5 Sep 2026 15:38:09 +0100
+Subject: [PATCH 2044/2064] RendererDRMPRIMEGLES: sample the buffer for the eye
+ being drawn
+
+The GUI is drawn once per eye, and this renderer crops the packed frame to the
+half the current view wants. Where the views arrive as a buffer each there is
+nothing to crop: the eye picks the buffer and the source rectangle stays the whole
+frame, which the shared geometry already leaves alone for a source that is not
+packed.
+
+This is the path a Wayland session takes, where there is no video plane to scan
+out on, and the one a GBM session falls back to when RendererDRMPRIME cannot claim
+a second plane.
+
+The texture cache holds an imported texture per dma-buf and a multiview stream has
+a frame per view in flight, so raise its cap for the same reason as the
+framebuffer cache.
+
+(cherry picked from commit 006c50c4594ea876efc9b3791fd99fd0077971b4)
+---
+ .../VideoRenderers/HwDecRender/DRMPRIMEEGL.h  |  5 +--
+ .../HwDecRender/RendererDRMPRIMEGLES.cpp      | 34 ++++++++++++++-----
+ .../HwDecRender/RendererDRMPRIMEGLES.h        |  2 ++
+ 3 files changed, 31 insertions(+), 10 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DRMPRIMEEGL.h b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DRMPRIMEEGL.h
+index 0aaf8416b9..79c365cf18 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DRMPRIMEEGL.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DRMPRIMEEGL.h
+@@ -91,8 +91,9 @@ protected:
+ class CDRMPRIMETexturePool
+ {
+ public:
+-  // must exceed the decoder's dma-buf pool (v4l2m2m has been seen with 20+ CAPTURE buffers)
+-  static constexpr size_t MAX_ENTRIES = 32;
++  // must exceed the decoder's dma-buf pool (v4l2m2m has been seen with 20+ CAPTURE
++  // buffers, and a multiview stream has a frame per view in flight)
++  static constexpr size_t MAX_ENTRIES = 64;
+ 
+   void Init(EGLDisplay eglDisplay);
+   //! \brief Imported OES texture for the buffer's dma-buf; nullptr on import failure.
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIMEGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIMEGLES.cpp
+index 3f17f5f7c3..cf5fc491b4 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIMEGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIMEGLES.cpp
+@@ -97,7 +97,7 @@ bool CRendererDRMPRIMEGLES::Configure(const VideoPicture& picture,
+   m_iFlags = GetFlagsChromaPosition(picture.chroma_position) |
+              GetFlagsColorMatrix(picture.color_space, picture.iWidth, picture.iHeight) |
+              GetFlagsColorPrimaries(picture.color_primaries) |
+-             GetFlagsStereoMode(picture.stereoMode);
++             GetFlagsStereoMode(picture.stereoMode, picture.separateViews);
+ 
+   // Calculate the input frame aspect ratio.
+   CalculateFrameAspectRatio(picture.iDisplayWidth, picture.iDisplayHeight);
+@@ -281,17 +281,24 @@ void CRendererDRMPRIMEGLES::AddVideoPicture(const VideoPicture& picture, int ind
+   if (buf.videoBuffer)
+   {
+     CLog::LogF(LOGERROR, "unreleased video buffer");
+-    if (buf.fence)
+-      buf.fence->DestroyFence();
+-    buf.videoBuffer->Release();
++    ReleaseBuffer(index);
+   }
++
+   buf.videoBuffer = picture.videoBuffer;
+   buf.videoBuffer->Acquire();
++  if (picture.videoBuffer2)
++  {
++    buf.videoBuffer2 = picture.videoBuffer2;
++    buf.videoBuffer2->Acquire();
++  }
+ 
+   // CDVDVideoCodecDRMPRIME fills its buffers at decode; CVideoBufferDMA arrives unfilled
+-  auto* drmBuffer = dynamic_cast<CVideoBufferDRMPRIME*>(picture.videoBuffer);
+-  if (drmBuffer && !dynamic_cast<CVideoBufferDRMPRIMEFFmpeg*>(drmBuffer))
+-    drmBuffer->SetPictureParams(picture);
++  for (CVideoBuffer* videoBuffer : {picture.videoBuffer, picture.videoBuffer2})
++  {
++    auto* drmBuffer = dynamic_cast<CVideoBufferDRMPRIME*>(videoBuffer);
++    if (drmBuffer && !dynamic_cast<CVideoBufferDRMPRIMEFFmpeg*>(drmBuffer))
++      drmBuffer->SetPictureParams(picture);
++  }
+ }
+ 
+ bool CRendererDRMPRIMEGLES::Flush(bool saveBuffers)
+@@ -315,6 +322,11 @@ void CRendererDRMPRIMEGLES::ReleaseBuffer(int index)
+     buf.videoBuffer->Release();
+     buf.videoBuffer = nullptr;
+   }
++  if (buf.videoBuffer2)
++  {
++    buf.videoBuffer2->Release();
++    buf.videoBuffer2 = nullptr;
++  }
+ }
+ 
+ bool CRendererDRMPRIMEGLES::NeedBuffer(int index)
+@@ -456,7 +468,13 @@ void CRendererDRMPRIMEGLES::Render(unsigned int flags, int index)
+ {
+   BUFFER& buf = m_buffers[index];
+ 
+-  CVideoBufferDRMPRIME* buffer = dynamic_cast<CVideoBufferDRMPRIME*>(buf.videoBuffer);
++  // Where the decoder kept the views apart, the eye being drawn picks the buffer rather
++  // than a half of one, and the source rect stays the whole frame.
++  CVideoBuffer* videoBuffer = buf.videoBuffer;
++  if (buf.videoBuffer2 && GetEffectiveStereoView() == RenderStereoView::RIGHT)
++    videoBuffer = buf.videoBuffer2;
++
++  CVideoBufferDRMPRIME* buffer = dynamic_cast<CVideoBufferDRMPRIME*>(videoBuffer);
+   if (!buffer || !buffer->IsValid())
+     return;
+ 
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIMEGLES.h b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIMEGLES.h
+index 49d3dd4177..e755178a4a 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIMEGLES.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIMEGLES.h
+@@ -96,6 +96,8 @@ private:
+   struct BUFFER
+   {
+     CVideoBuffer* videoBuffer = nullptr;
++    //! The second eye, when the decoder kept the views in a buffer each.
++    CVideoBuffer* videoBuffer2 = nullptr;
+     std::unique_ptr<KODI::UTILS::EGL::CEGLFence> fence;
+   } m_buffers[NUM_BUFFERS];
+ 
+-- 
+2.56.0
+

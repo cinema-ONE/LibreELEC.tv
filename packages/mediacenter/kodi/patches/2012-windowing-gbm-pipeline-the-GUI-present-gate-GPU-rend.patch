@@ -1,0 +1,356 @@
+From e1574f2752918aac3a2269b048bd856f1e599387 Mon Sep 17 00:00:00 2001
+From: Dom Cobley <popcornmix@gmail.com>
+Date: Fri, 26 Jun 2026 17:50:31 +0100
+Subject: [PATCH 2012/2064] windowing/gbm: pipeline the GUI present - gate GPU
+ render and CPU pacing on different flips
+
+The async present path (CDRMAtomic NONBLOCK commit + explicit fencing)
+inserted, before each eglSwapBuffers, a GPU-side wait on the *previous* flip's
+KMS out-fence, and after the swap a CPU wait (eglClientWaitSyncKHR,
+EGL_FOREVER) on that same fence:
+
+    fd = TakeOutFenceFd();        // out-fence of the immediately previous commit
+    CreateKMSFence(fd);
+    WaitSyncGPU();                // GPU defers this frame's work until that flip
+    ...swap...
+    SetInFenceFd(gpuFence);       // KMS defers scanout until this render completes
+    WaitSyncCPU();                // CPU blocks until that same flip
+
+Both waits targeting the immediately-preceding flip make the render pipeline
+exactly one frame deep: the GPU cannot start frame N+1 until frame N is on
+screen, and the present thread is likewise pinned to that flip. For a trivial
+scene that is fine, but a non-trivial GUI composite (a scrolling plot, or the
+FBO/HDR composite path) intermittently needs more than the post-vblank slice
+of a refresh interval, loses the next vblank, and the flip slips by one -
+giving an alternating one-/two-vblank cadence that averages ~40fps on a 60Hz
+panel. CPU and GPU both sit well below capacity because the time is spent
+idle-waiting on the fence, not computing.
+
+Split the two waits so the pipeline is two frames deep with one frame of slack:
+
+  - GPU render gate -> the flip *before* last (N-2). N-2's out-fence guards the
+    buffer mesa is about to recycle as this frame's render target, so it is the
+    correct and sufficient gate; it lets the GPU render this frame while the
+    previous flip is still pending instead of stalling on it. Implemented by
+    holding (a dup of) the previous out-fence one frame in m_kmsFenceFd and
+    issuing the GPU wait on it via the new WaitSyncGPU(int fd).
+
+  - CPU pacing -> the previous flip (N-1). Blocking the present thread until the
+    previous flip lands is the back-pressure that paces the GUI render loop to
+    the display refresh. The GUI loop (CApplication::Run) has no other frame
+    limiter, so without this it free-runs above refresh on light scenes -
+    e.g. ~79fps at 1080p on a 60Hz panel - burning GPU on frames that are never
+    scanned out. Because the wait overlaps the render just submitted by
+    eglSwapBuffers, capping at refresh does not reintroduce the stall.
+
+Net effect: GPU-bound scenes (e.g. 1440p) run at whatever the GPU sustains
+instead of stalling to 40, and GPU-light scenes are capped cleanly at the
+refresh rate instead of wasting work above it. Cost is at most one extra frame
+of presentation latency, only to the extent the extra pipeline slot is filled.
+
+Correctness is unchanged:
+  - The freshly rendered front buffer is still the one committed to KMS.
+  - KMS still waits for this frame's GPU render via IN_FENCE_FD, so no
+    partially-rendered frame is scanned out.
+  - The buffer mesa recycles is older than the N-2 fence the GPU gates on, and
+    the GBMUtils buffer queue keeps the on-screen and pending buffers locked,
+    so a buffer still being scanned out is never handed back for rendering.
+
+Also fold the byte-identical fence sequence that the GL and GLES PresentRender()
+implementations each carried into FencePreSwap()/FencePostSwap() on the shared
+base CWinSystemGbmEGLContext, and clear m_kmsFence after destroy in
+WaitSyncCPU() (a frame whose previous commit produced no out-fence skips
+CreateKMSFence, so the stale handle could otherwise be double-destroyed).
+
+(cherry picked from commit 8bd17d59c1dc35cf1937f3ab79378d64cc8fe4b1)
+---
+ xbmc/utils/EGLFence.cpp                       | 33 ++++++++--
+ xbmc/utils/EGLFence.h                         |  2 +-
+ xbmc/windowing/gbm/WinSystemGbmEGLContext.cpp | 64 +++++++++++++++++++
+ xbmc/windowing/gbm/WinSystemGbmEGLContext.h   | 28 ++++++++
+ xbmc/windowing/gbm/WinSystemGbmGLContext.cpp  | 22 +------
+ .../windowing/gbm/WinSystemGbmGLESContext.cpp | 22 +------
+ 6 files changed, 124 insertions(+), 47 deletions(-)
+
+diff --git a/xbmc/utils/EGLFence.cpp b/xbmc/utils/EGLFence.cpp
+index 58a9ec1683..8b3f4292b3 100644
+--- a/xbmc/utils/EGLFence.cpp
++++ b/xbmc/utils/EGLFence.cpp
+@@ -119,13 +119,21 @@ EGLint CEGLFence::FlushFence()
+   return fd;
+ }
+ 
+-void CEGLFence::WaitSyncGPU()
++void CEGLFence::WaitSyncGPU(int fd)
+ {
+-  if (!m_kmsFence)
++  // Wrap an external KMS out-fence fd and queue a GPU-side wait on it, then
++  // release the wrapper. eglWaitSyncKHR only enqueues the wait into the current
++  // context's command stream - it does not block the CPU - and the queued wait
++  // keeps the underlying fence alive, so the EGLSync (which takes ownership of
++  // fd and closes it on destroy) can be torn down immediately.
++  EGLSyncKHR fence = CreateFence(fd);
++  if (fence == EGL_NO_SYNC_KHR)
+     return;
+ 
+-  if (m_eglWaitSyncKHR(m_display, m_kmsFence, 0) != EGL_TRUE)
+-    CEGLUtils::Log(LOGERROR, "failed to create EGL sync point");
++  if (m_eglWaitSyncKHR(m_display, fence, 0) != EGL_TRUE)
++    CEGLUtils::Log(LOGERROR, "failed to insert KMS out-fence GPU wait");
++
++  m_eglDestroySyncKHR(m_display, fence);
+ }
+ 
+ void CEGLFence::WaitSyncCPU()
+@@ -133,7 +141,20 @@ void CEGLFence::WaitSyncCPU()
+   if (!m_kmsFence)
+     return;
+ 
+-  if (m_eglClientWaitSyncKHR(m_display, m_kmsFence, 0, EGL_FOREVER_KHR) != EGL_FALSE)
+-    m_eglDestroySyncKHR(m_display, m_kmsFence);
++  // CPU-block until this KMS out-fence signals, then destroy it. The caller
++  // hands us the out-fence of the *previous* flip, so blocking here paces the
++  // present thread to one committed frame per flip - i.e. to the display
++  // refresh. Without this back-pressure the GUI render loop (which has no other
++  // frame limiter) free-runs above refresh on light scenes, burning GPU on
++  // frames that are never scanned out. The wait overlaps this frame's render,
++  // which was already submitted by the preceding eglSwapBuffers, so capping at
++  // refresh does not stall the pipeline.
++  m_eglClientWaitSyncKHR(m_display, m_kmsFence, 0, EGL_FOREVER_KHR);
++  m_eglDestroySyncKHR(m_display, m_kmsFence);
++
++  // Clear after destroy. CreateKMSFence is skipped on a frame whose previous
++  // commit produced no out-fence (fd == -1), so without this a later call would
++  // re-destroy this already-freed handle.
++  m_kmsFence = EGL_NO_SYNC_KHR;
+ }
+ #endif
+diff --git a/xbmc/utils/EGLFence.h b/xbmc/utils/EGLFence.h
+index 03c246b60b..c0bc71b53c 100644
+--- a/xbmc/utils/EGLFence.h
++++ b/xbmc/utils/EGLFence.h
+@@ -34,7 +34,7 @@ public:
+   void CreateKMSFence(int fd);
+   void CreateGPUFence();
+   EGLint FlushFence();
+-  void WaitSyncGPU();
++  void WaitSyncGPU(int fd);
+   void WaitSyncCPU();
+ #endif
+ 
+diff --git a/xbmc/windowing/gbm/WinSystemGbmEGLContext.cpp b/xbmc/windowing/gbm/WinSystemGbmEGLContext.cpp
+index 6f19a9db3f..32af46d8b5 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmEGLContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmEGLContext.cpp
+@@ -14,6 +14,8 @@
+ #include "cores/VideoPlayer/VideoRenderers/RenderFactory.h"
+ #include "utils/log.h"
+ 
++#include <unistd.h>
++
+ using namespace KODI::WINDOWING::GBM;
+ using namespace KODI::WINDOWING::LINUX;
+ 
+@@ -190,10 +192,72 @@ bool CWinSystemGbmEGLContext::DestroyWindow()
+ {
+   m_eglContext.DestroySurface();
+ 
++  // Release the deferred out-fence that would otherwise be consumed (and
++  // closed) by the next frame's FencePreSwap(), which will not run now.
++  if (m_kmsFenceFd != -1)
++  {
++    close(m_kmsFenceFd);
++    m_kmsFenceFd = -1;
++  }
++
+   CLog::Log(LOGDEBUG, "CWinSystemGbmEGLContext::{} - deinitialized GBM", __FUNCTION__);
+   return true;
+ }
+ 
++void CWinSystemGbmEGLContext::FencePreSwap()
++{
++#if defined(EGL_ANDROID_native_fence_sync) && defined(EGL_KHR_fence_sync)
++  if (!m_eglFence)
++    return;
++
++  // out-fence of the previous commit (call it frame N-1).
++  int fd = m_DRM->TakeOutFenceFd();
++
++  // GPU side: gate this frame's render on the flip *before* last (N-2), not the
++  // previous flip. N-2's out-fence guards the buffer mesa is about to recycle
++  // as this frame's render target; gating on the previous flip instead pinned
++  // every render to a vblank boundary, held the pipeline one frame deep, and on
++  // a heavier-than-trivial composite lost a vblank intermittently - capping
++  // throughput (~40fps on a 60Hz panel) with the GPU idle-waiting. Gating on
++  // N-2 lets the GPU render this frame while frame N-1 is still pending its
++  // flip. It stays safe: the recycled buffer is older than N-2, and KMS still
++  // waits for this render via IN_FENCE_FD (set in FencePostSwap).
++  if (m_kmsFenceFd != -1)
++    m_eglFence->WaitSyncGPU(m_kmsFenceFd); // consumes (closes) the N-2 fd
++  m_kmsFenceFd = (fd != -1) ? dup(fd) : -1; // keep a copy of N-1 for next frame's GPU gate
++
++  // CPU side: WaitSyncCPU (in FencePostSwap) blocks on this same N-1 out-fence,
++  // i.e. until the previous flip actually lands. That is the back-pressure that
++  // paces the GUI loop to the display refresh; gating the GPU on N-2 while the
++  // CPU waits on N-1 is what caps fps at refresh *and* keeps one frame of slack
++  // to absorb a long composite. The wait overlaps this frame's render, so it
++  // does not reintroduce the stall.
++  if (fd != -1)
++    m_eglFence->CreateKMSFence(fd); // CPU fence = N-1; consumed by WaitSyncCPU
++
++  m_eglFence->CreateGPUFence();
++#endif
++}
++
++void CWinSystemGbmEGLContext::FencePostSwap()
++{
++#if defined(EGL_ANDROID_native_fence_sync) && defined(EGL_KHR_fence_sync)
++  if (!m_eglFence)
++    return;
++
++  // Hand this frame's GPU render fence to KMS as IN_FENCE_FD so the kernel
++  // defers scanout until the render completes (tear-free).
++  int fd = m_eglFence->FlushFence();
++  m_DRM->SetInFenceFd(fd);
++
++  // CPU back-pressure: block until the previous flip (the N-1 out-fence wrapped
++  // in FencePreSwap) lands, pacing the GUI loop to the display refresh. This
++  // overlaps the render just submitted, so it caps fps at refresh without
++  // stalling. See WaitSyncCPU().
++  m_eglFence->WaitSyncCPU();
++#endif
++}
++
+ bool CWinSystemGbmEGLContext::SetVideoOutput(const VideoPicture* videoPicture)
+ {
+   // Override: the base only flips the gui/video plane role. On EGL
+diff --git a/xbmc/windowing/gbm/WinSystemGbmEGLContext.h b/xbmc/windowing/gbm/WinSystemGbmEGLContext.h
+index 1580be947e..992f734092 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmEGLContext.h
++++ b/xbmc/windowing/gbm/WinSystemGbmEGLContext.h
+@@ -59,10 +59,38 @@ protected:
+   bool ChooseEGLConfig(EGLint renderableType, int bitDepth = 8);
+   virtual bool CreateContext() = 0;
+ 
++  /**
++   * @brief Insert the GPU-side KMS fence wait before eglSwapBuffers.
++   *
++   * Deferred by one frame: waits on the out-fence of the frame *before* last
++   * rather than the most recent flip, so the GPU may render one frame ahead of
++   * the display (triple-buffered pipelining). Call only on a rendered, async
++   * (non video-layer) frame. Does not block the CPU.
++   */
++  void FencePreSwap();
++
++  /**
++   * @brief Hand the GPU render fence to KMS as IN_FENCE_FD after eglSwapBuffers.
++   *
++   * Pairs with FencePreSwap(); call under the same conditions.
++   */
++  void FencePostSwap();
++
+   EGLint m_renderableType{0};
+ 
+   std::unique_ptr<KODI::UTILS::EGL::CEGLFence> m_eglFence;
+ 
++  /**
++   * @brief A dup of the previous frame's KMS out-fence, held one frame over.
++   *
++   * Used as the GPU-side render gate (the frame-before-last flip) so the GPU
++   * may render ahead while the previous flip is still pending, while the CPU
++   * back-pressure waits on the more recent flip. -1 when none is pending.
++   * Consumed (and closed) by WaitSyncGPU() on the next frame, or by
++   * DestroyWindow() if no further frame runs.
++   */
++  int m_kmsFenceFd{-1};
++
+   struct delete_CVaapiProxy
+   {
+     void operator()(CVaapiProxy* p) const;
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLContext.cpp b/xbmc/windowing/gbm/WinSystemGbmGLContext.cpp
+index d6c7afb3a3..7e3457b4db 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLContext.cpp
+@@ -127,19 +127,8 @@ void CWinSystemGbmGLContext::PresentRender(bool rendered, bool videoLayer)
+     bool async = !videoLayer && m_eglFence;
+     if (rendered)
+     {
+-#if defined(EGL_ANDROID_native_fence_sync) && defined(EGL_KHR_fence_sync)
+       if (async)
+-      {
+-        int fd = m_DRM->TakeOutFenceFd();
+-        if (fd != -1)
+-        {
+-          m_eglFence->CreateKMSFence(fd);
+-          m_eglFence->WaitSyncGPU();
+-        }
+-
+-        m_eglFence->CreateGPUFence();
+-      }
+-#endif
++        FencePreSwap();
+ 
+       if (!m_eglContext.TrySwapBuffers())
+       {
+@@ -147,15 +136,8 @@ void CWinSystemGbmGLContext::PresentRender(bool rendered, bool videoLayer)
+         throw std::runtime_error("eglSwapBuffers failed");
+       }
+ 
+-#if defined(EGL_ANDROID_native_fence_sync) && defined(EGL_KHR_fence_sync)
+       if (async)
+-      {
+-        int fd = m_eglFence->FlushFence();
+-        m_DRM->SetInFenceFd(fd);
+-
+-        m_eglFence->WaitSyncCPU();
+-      }
+-#endif
++        FencePostSwap();
+     }
+ 
+     CWinSystemGbm::FlipPage(rendered, videoLayer, async);
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+index b3eb401fde..107f28dbbc 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+@@ -144,19 +144,8 @@ void CWinSystemGbmGLESContext::PresentRender(bool rendered, bool videoLayer)
+     bool async = !videoLayer && m_eglFence;
+     if (rendered)
+     {
+-#if defined(EGL_ANDROID_native_fence_sync) && defined(EGL_KHR_fence_sync)
+       if (async)
+-      {
+-        int fd = m_DRM->TakeOutFenceFd();
+-        if (fd != -1)
+-        {
+-          m_eglFence->CreateKMSFence(fd);
+-          m_eglFence->WaitSyncGPU();
+-        }
+-
+-        m_eglFence->CreateGPUFence();
+-      }
+-#endif
++        FencePreSwap();
+ 
+       if (!m_eglContext.TrySwapBuffers())
+       {
+@@ -164,15 +153,8 @@ void CWinSystemGbmGLESContext::PresentRender(bool rendered, bool videoLayer)
+         throw std::runtime_error("eglSwapBuffers failed");
+       }
+ 
+-#if defined(EGL_ANDROID_native_fence_sync) && defined(EGL_KHR_fence_sync)
+       if (async)
+-      {
+-        int fd = m_eglFence->FlushFence();
+-        m_DRM->SetInFenceFd(fd);
+-
+-        m_eglFence->WaitSyncCPU();
+-      }
+-#endif
++        FencePostSwap();
+     }
+ 
+     CWinSystemGbm::FlipPage(rendered, videoLayer, async);
+-- 
+2.56.0
+

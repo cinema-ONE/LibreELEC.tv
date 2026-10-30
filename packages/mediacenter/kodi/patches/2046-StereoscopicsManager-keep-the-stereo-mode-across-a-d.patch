@@ -1,0 +1,77 @@
+From dca56677e3ec08793cf6d99504239febd62f7d64 Mon Sep 17 00:00:00 2001
+From: Dom Cobley <popcornmix@gmail.com>
+Date: Sun, 13 Sep 2026 12:03:39 +0100
+Subject: [PATCH 2046/2064] StereoscopicsManager: keep the stereo mode across a
+ disc menu
+
+A Blu-ray 3D menu makes the display change mode as it loads, several times
+over, between the stereoscopic mode the disc asks for and none at all.
+
+A menu's pages are play items, and only some of them carry a second eye. Each
+arrives as a stream change, and the stereo mode is settled again on every one
+of those: a page without a second eye is not stereoscopic, so the mode goes,
+and the next page that has one brings it back. Both directions reconfigure the
+display, and one menu gets through several pages while it loads.
+
+That decision is meant for the item that has just started -- the setting behind
+it is "disable stereoscopic 3D mode when playback ended" -- and a page of a menu
+is not one. Leave the mode alone while a disc menu is on screen, and let what
+the menu leads to settle it. Outside a menu nothing changes, so a 2D title
+started over the top of a 3D one still leaves stereoscopic mode as before.
+
+(cherry picked from commit 20e1f46793651efceffe964d1196e685be5b7a43)
+---
+ xbmc/guilib/StereoscopicsManager.cpp | 15 ++++++++++++++-
+ xbmc/guilib/StereoscopicsManager.h   |  3 +++
+ 2 files changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/xbmc/guilib/StereoscopicsManager.cpp b/xbmc/guilib/StereoscopicsManager.cpp
+index c5568060d0..649a7b134c 100644
+--- a/xbmc/guilib/StereoscopicsManager.cpp
++++ b/xbmc/guilib/StereoscopicsManager.cpp
+@@ -652,6 +652,14 @@ std::string CStereoscopicsManager::GetVideoStereoMode() const
+   return playerMode;
+ }
+ 
++bool CStereoscopicsManager::IsPlayerInMenu()
++{
++  const auto& components = CServiceBroker::GetAppComponents();
++  const auto appPlayer = components.GetComponent<CApplicationPlayer>();
++
++  return appPlayer && appPlayer->IsInMenu();
++}
++
+ bool CStereoscopicsManager::IsVideoStereoscopic() const
+ {
+   std::string mode = GetVideoStereoMode();
+@@ -699,7 +707,12 @@ void CStereoscopicsManager::UpdateStereoModeForStream()
+   {
+     // exit stereo mode if started item is not stereoscopic
+     // and if user prefers to stop 3D playback when movie is finished
+-    if (mode != RenderStereoMode::OFF &&
++    //
++    // Not for a disc menu. Its pages come and go as play items, only some of them 3D, and
++    // each arrives as a stream change of its own - so following them means reconfiguring the
++    // display both ways for every page, which one menu can do several times over while it
++    // loads. What the menu leads to decides the mode instead.
++    if (!IsPlayerInMenu() && mode != RenderStereoMode::OFF &&
+         m_settings->GetBool(CSettings::SETTING_VIDEOPLAYER_QUITSTEREOMODEONSTOP))
+       SetStereoMode(RenderStereoMode::OFF);
+     return;
+diff --git a/xbmc/guilib/StereoscopicsManager.h b/xbmc/guilib/StereoscopicsManager.h
+index 337e835580..50375593a2 100644
+--- a/xbmc/guilib/StereoscopicsManager.h
++++ b/xbmc/guilib/StereoscopicsManager.h
+@@ -104,6 +104,9 @@ private:
+   std::string GetVideoStereoMode() const;
+   bool IsVideoStereoscopic() const;
+ 
++  //! \brief Whether what is playing is showing a disc menu.
++  static bool IsPlayerInMenu();
++
+   void SetStereoModeByUser(const RenderStereoMode mode);
+ 
+   /*! Whether the stereo mode of the stream being played has been settled - see
+-- 
+2.56.0
+

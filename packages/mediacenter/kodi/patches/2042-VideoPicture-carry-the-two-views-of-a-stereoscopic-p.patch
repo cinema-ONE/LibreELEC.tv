@@ -1,0 +1,237 @@
+From 20d1566b290c3f81502a37fe1261eb8b69a0f618 Mon Sep 17 00:00:00 2001
+From: Dom Cobley <popcornmix@gmail.com>
+Date: Sat, 5 Sep 2026 15:37:45 +0100
+Subject: [PATCH 2042/2064] VideoPicture: carry the two views of a stereoscopic
+ picture separately
+
+A picture holds one buffer, so a decoder with an eye in each hand has nowhere to
+put the second one. That is why the multiview decoders pack the views side by
+side: not because anything wants a packed frame, but because it is the only shape
+that fits through here. The renderers then undo it, cropping an eye back out.
+
+Give a picture a second buffer and a flag saying the views arrived that way. The
+flag sits beside the pointer rather than being inferred from it because
+SetParams() drops the buffer references, and the copy of the picture that a
+CVideoBufferDRMPRIME caches is the only thing a renderer has to go on when it is
+deciding, before it has ever been configured, whether it can present the stream
+at all.
+
+CONF_FLAGS_STEREO_MODE_SEPARATE takes the free value in the existing mode mask
+and says the frame is not packed. It is worth having as its own value rather than
+as a flag beside SBS: ManageRenderArea() then falls through its switch and leaves
+the source rectangle alone, and GetPerEyeAspectRatio() falls through to the plain
+ratio, which is right, because a view that was never packed already has the aspect
+it should. So the shared geometry needs no teaching. The cadence bit is untouched
+and keeps saying which eye leads, so right_left sources and the viewer's eye swap
+go on working as they are.
+
+GetEffectiveStereoView() is the swap that ManageRenderArea() already did inline,
+lifted out so a renderer choosing between two buffers and one cropping a packed
+frame agree on which eye they are drawing.
+
+Nothing produces a second buffer yet.
+
+(cherry picked from commit 5f4eff6cdb0cea6a1799eafa616d79011eb46f7b)
+---
+ .../DVDCodecs/Video/DVDVideoCodec.cpp         | 20 +++++++++++++++-
+ .../DVDCodecs/Video/DVDVideoCodec.h           |  8 +++++++
+ .../VideoRenderers/BaseRenderer.cpp           | 24 ++++++++++++-------
+ .../VideoPlayer/VideoRenderers/BaseRenderer.h | 10 ++++++++
+ .../VideoRenderers/RenderFlags.cpp            | 10 ++++++++
+ .../VideoPlayer/VideoRenderers/RenderFlags.h  |  5 ++++
+ 6 files changed, 67 insertions(+), 10 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.cpp
+index a41939d8fd..ad2695fd4a 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.cpp
+@@ -22,6 +22,10 @@ VideoPicture::~VideoPicture()
+   {
+     videoBuffer->Release();
+   }
++  if (videoBuffer2)
++  {
++    videoBuffer2->Release();
++  }
+ }
+ 
+ void VideoPicture::Reset()
+@@ -29,6 +33,10 @@ void VideoPicture::Reset()
+   if (videoBuffer)
+     videoBuffer->Release();
+   videoBuffer = nullptr;
++  if (videoBuffer2)
++    videoBuffer2->Release();
++  videoBuffer2 = nullptr;
++  separateViews = false;
+   pts = DVD_NOPTS_VALUE;
+   dts = DVD_NOPTS_VALUE;
+   iFlags = 0;
+@@ -64,9 +72,13 @@ VideoPicture& VideoPicture::CopyRef(const VideoPicture &pic)
+ {
+   if (videoBuffer)
+     videoBuffer->Release();
++  if (videoBuffer2)
++    videoBuffer2->Release();
+   *this = pic;
+   if (videoBuffer)
+     videoBuffer->Acquire();
++  if (videoBuffer2)
++    videoBuffer2->Acquire();
+   return *this;
+ }
+ 
+@@ -74,8 +86,13 @@ VideoPicture& VideoPicture::SetParams(const VideoPicture &pic)
+ {
+   if (videoBuffer)
+     videoBuffer->Release();
++  if (videoBuffer2)
++    videoBuffer2->Release();
++  // separateViews is a parameter rather than a reference, so it survives here: it is
++  // how a consumer holding only this copy knows the picture had a second view.
+   *this = pic;
+   videoBuffer = nullptr;
++  videoBuffer2 = nullptr;
+   return *this;
+ }
+ 
+@@ -100,7 +117,8 @@ bool VideoPicture::IsSameParams(const VideoPicture& pic) const
+ {
+   return this->iWidth == pic.iWidth && this->iHeight == pic.iHeight &&
+          this->iDisplayWidth == pic.iDisplayWidth && this->iDisplayHeight == pic.iDisplayHeight &&
+-         this->stereoMode == pic.stereoMode && this->color_primaries == pic.color_primaries &&
++         this->stereoMode == pic.stereoMode && this->separateViews == pic.separateViews &&
++         this->color_primaries == pic.color_primaries &&
+          this->color_transfer == pic.color_transfer && this->hdrType == pic.hdrType &&
+          CompareDisplayMetadata(pic);
+ }
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h
+index 08933a0c10..076ceec543 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h
+@@ -54,6 +54,14 @@ public:
+ 
+   CVideoBuffer *videoBuffer = nullptr;
+ 
++  //! The other eye, when the decoder hands the two views of a stereoscopic picture over
++  //! separately rather than packed into videoBuffer. stereoMode says which eye is which.
++  CVideoBuffer* videoBuffer2 = nullptr;
++
++  //! Whether the views arrive separately. Beside the pointer because it has to survive
++  //! SetParams(), which drops the buffer references.
++  bool separateViews = false;
++
+   double pts; // timestamp in seconds, used in the CVideoPlayer class to keep track of pts
+   double dts;
+   unsigned int iFlags;
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/BaseRenderer.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/BaseRenderer.cpp
+index d6f144f5fa..c203997f06 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/BaseRenderer.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/BaseRenderer.cpp
+@@ -319,15 +319,7 @@ void CBaseRenderer::ManageRenderArea()
+   m_sourceRect.y2 = (float)m_sourceHeight;
+ 
+   unsigned int stereo_mode  = CONF_FLAGS_STEREO_MODE_MASK(m_iFlags);
+-  auto stereo_view = CServiceBroker::GetWinSystem()->GetGfxContext().GetStereoView();
+-
+-  if(CONF_FLAGS_STEREO_CADENCE(m_iFlags) == CONF_FLAGS_STEREO_CADANCE_RIGHT_LEFT)
+-  {
+-    if (stereo_view == RenderStereoView::LEFT)
+-      stereo_view = RenderStereoView::RIGHT;
+-    else if (stereo_view == RenderStereoView::RIGHT)
+-      stereo_view = RenderStereoView::LEFT;
+-  }
++  const RenderStereoView stereo_view = GetEffectiveStereoView();
+ 
+   switch(stereo_mode)
+   {
+@@ -360,6 +352,20 @@ void CBaseRenderer::ManageRenderArea()
+                        CDisplaySettings::GetInstance().GetVerticalShift());
+ }
+ 
++RenderStereoView CBaseRenderer::GetEffectiveStereoView() const
++{
++  const RenderStereoView view = CServiceBroker::GetWinSystem()->GetGfxContext().GetStereoView();
++
++  if (CONF_FLAGS_STEREO_CADENCE(m_iFlags) != CONF_FLAGS_STEREO_CADANCE_RIGHT_LEFT)
++    return view;
++
++  if (view == RenderStereoView::LEFT)
++    return RenderStereoView::RIGHT;
++  if (view == RenderStereoView::RIGHT)
++    return RenderStereoView::LEFT;
++  return view;
++}
++
+ float CBaseRenderer::GetPerEyeAspectRatio() const
+ {
+   const float ratio = GetAspectRatio();
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/BaseRenderer.h b/xbmc/cores/VideoPlayer/VideoRenderers/BaseRenderer.h
+index 74c3a51594..61629f263b 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/BaseRenderer.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/BaseRenderer.h
+@@ -13,6 +13,7 @@
+ #include "VideoShaders/ShaderFormats.h"
+ #include "cores/IPlayer.h"
+ #include "cores/VideoPlayer/Buffers/VideoBuffer.h"
++#include "rendering/RenderSystemTypes.h"
+ #include "utils/Geometry.h"
+ 
+ #include <utility>
+@@ -138,6 +139,15 @@ protected:
+    */
+   float GetPerEyeAspectRatio() const;
+ 
++  /*!
++   * \brief The stereo view to present, with the source's right_left cadence applied.
++   *
++   * The window system's view says which half of the display is being drawn; the cadence
++   * says which eye the source puts first. Renderers need the combination, to crop the
++   * right half of a packed frame or to pick the right one of two separate views.
++   */
++  RenderStereoView GetEffectiveStereoView() const;
++
+   virtual void ManageRenderArea();
+   virtual void ReorderDrawPoints();
+   virtual EShaderFormat GetShaderFormat();
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/RenderFlags.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/RenderFlags.cpp
+index 5a4a2e6e90..bea9752006 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/RenderFlags.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/RenderFlags.cpp
+@@ -87,3 +87,13 @@ unsigned int GetFlagsStereoMode(const std::string& mode)
+   return convert[mode];
+ }
+ 
++unsigned int GetFlagsStereoMode(const std::string& mode, bool separateViews)
++{
++  const unsigned int flags = GetFlagsStereoMode(mode);
++  if (!separateViews || CONF_FLAGS_STEREO_MODE_MASK(flags) == 0)
++    return flags;
++
++  // Only the packing changes: which eye leads is still the cadence's to say.
++  return (flags & ~CONF_FLAGS_STEREO_MODE_MASK(~0u)) | CONF_FLAGS_STEREO_MODE_SEPARATE;
++}
++
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/RenderFlags.h b/xbmc/cores/VideoPlayer/VideoRenderers/RenderFlags.h
+index 54f0524848..8da193dd91 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/RenderFlags.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/RenderFlags.h
+@@ -57,6 +57,9 @@
+ #define CONF_FLAGS_STEREO_MODE_MASK(a) ((a) & 0x007000)
+ #define CONF_FLAGS_STEREO_MODE_SBS     0x001000
+ #define CONF_FLAGS_STEREO_MODE_TAB     0x002000
++//! The views are not packed into the frame: each is a picture of its own, so nothing is
++//! cropped and each carries its own aspect. The cadence still says which eye is which.
++#define CONF_FLAGS_STEREO_MODE_SEPARATE 0x004000
+ 
+ #define CONF_FLAGS_STEREO_CADENCE(a) ((a) & 0x008000)
+ #define CONF_FLAGS_STEREO_CADANCE_LEFT_RIGHT 0x000000
+@@ -66,3 +69,5 @@ unsigned int GetFlagsColorMatrix(unsigned int color_matrix, unsigned width, unsi
+ unsigned int GetFlagsChromaPosition(unsigned int chroma_position);
+ unsigned int GetFlagsColorPrimaries(unsigned int color_primaries);
+ unsigned int GetFlagsStereoMode(const std::string& mode);
++//! \brief As above, but reporting the views as separate pictures rather than packed.
++unsigned int GetFlagsStereoMode(const std::string& mode, bool separateViews);
+-- 
+2.56.0
+

@@ -1,0 +1,115 @@
+From: cinemaONE <35371193+cinema-ONE@users.noreply.github.com>
+Subject: drm/amd/display: check HDR10PLUS_VSIF in the connector atomic check
+
+Linux 7.3 moved the connector atomic check to amdgpu_dm_connector.c; this is
+where 0129 checks HDR10PLUS_VSIF, and its link helper moves to the header.
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index 2874cf5..ae3d477 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -4117,13 +4117,6 @@ bool amdgpu_dm_dvbridge_dcn_reviewed(const struct amdgpu_device *adev)
+ }
+ 
+ 
+-/* Hades: the links that carry HDR10PLUS_VSIF (amdgpu_dm_hdr10plus.h) */
+-static bool amdgpu_dm_hdr10plus_link(enum signal_type signal)
+-{
+-	return dc_is_hdmi_signal(signal) ||
+-	       (dc_is_dp_signal(signal) && signal != SIGNAL_TYPE_EDP);
+-}
+-
+ /*
+  * Hades: the HDR10+ packet of a connector state for a stream's link (amdgpu_dm_hdr10plus.h):
+  * invalid without HDR10PLUS_VSIF, and on a link that does not carry it, which the atomic check
+@@ -5347,31 +5340,6 @@ static int amdgpu_dm_atomic_setup_commit(struct drm_atomic_commit *state)
+ 		}
+ 	}
+ 
+-	/*
+-	 * Hades: HDR10PLUS_VSIF (amdgpu_dm_hdr10plus.h) changes a packet of the stream in place:
+-	 * never a modeset. Not with the Dolby Vision tunnel, whose Dolby VSIF is the dynamic
+-	 * metadata of its picture; not on a link that does not carry it.
+-	 */
+-	if (new_con_state->hdr10plus_vsif && dm_new_con_state->dvbridge_dv_standard) {
+-		drm_dbg_atomic(conn->dev, "[CONNECTOR:%d:%s] HDR10PLUS_VSIF with the Dolby Vision tunnel\n",
+-			       conn->base.id, conn->name);
+-		return -EINVAL;
+-	}
+-	if (!drm_connector_atomic_hdr10plus_vsif_equal(old_con_state, new_con_state)) {
+-		const struct dc_stream_state *stream;
+-
+-		new_crtc_state = drm_atomic_get_crtc_state(state, crtc);
+-		if (IS_ERR(new_crtc_state))
+-			return PTR_ERR(new_crtc_state);
+-		stream = to_dm_crtc_state(new_crtc_state)->stream;
+-		if (new_con_state->hdr10plus_vsif && stream &&
+-		    !amdgpu_dm_hdr10plus_link(stream->signal)) {
+-			drm_dbg_atomic(conn->dev, "[CONNECTOR:%d:%s] HDR10PLUS_VSIF on a link that does not carry it (signal %d)\n",
+-				       conn->base.id, conn->name, stream->signal);
+-			return -EINVAL;
+-		}
+-	}
+-
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_connector.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_connector.c
+index 3150f9c..d9661dd 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_connector.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_connector.c
+@@ -79,6 +79,7 @@
+ 
+ #include "amdgpu_dm_trace.h"
+ #include "amdgpu_dm_dvbridge.h"
++#include "amdgpu_dm_hdr10plus.h"
+ 
+ /* Encoder functions */
+ 
+@@ -2798,6 +2799,31 @@ amdgpu_dm_connector_atomic_check(struct drm_connector *conn,
+ 			!new_con_state->hdr_output_metadata;
+ 	}
+ 
++	/*
++	 * Hades: HDR10PLUS_VSIF (amdgpu_dm_hdr10plus.h) changes a packet of the stream in place:
++	 * never a modeset. Not with the Dolby Vision tunnel, whose Dolby VSIF is the dynamic
++	 * metadata of its picture; not on a link that does not carry it.
++	 */
++	if (new_con_state->hdr10plus_vsif && dm_new_con_state->dvbridge_dv_standard) {
++		drm_dbg_atomic(conn->dev, "[CONNECTOR:%d:%s] HDR10PLUS_VSIF with the Dolby Vision tunnel\n",
++			       conn->base.id, conn->name);
++		return -EINVAL;
++	}
++	if (!drm_connector_atomic_hdr10plus_vsif_equal(old_con_state, new_con_state)) {
++		const struct dc_stream_state *stream;
++
++		new_crtc_state = drm_atomic_get_crtc_state(state, crtc);
++		if (IS_ERR(new_crtc_state))
++			return PTR_ERR(new_crtc_state);
++		stream = to_dm_crtc_state(new_crtc_state)->stream;
++		if (new_con_state->hdr10plus_vsif && stream &&
++		    !amdgpu_dm_hdr10plus_link(stream->signal)) {
++			drm_dbg_atomic(conn->dev, "[CONNECTOR:%d:%s] HDR10PLUS_VSIF on a link that does not carry it (signal %d)\n",
++				       conn->base.id, conn->name, stream->signal);
++			return -EINVAL;
++		}
++	}
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_hdr10plus.h b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_hdr10plus.h
+index 77058b9..7fb80e7 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_hdr10plus.h
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_hdr10plus.h
+@@ -55,4 +55,11 @@ static inline int amdgpu_dm_hdr10plus_packet(const u8 *vsif, size_t size, bool h
+ 	return 0;
+ }
+ 
++/* Hades: the links that carry HDR10PLUS_VSIF (amdgpu_dm_hdr10plus.h) */
++static inline bool amdgpu_dm_hdr10plus_link(enum signal_type signal)
++{
++	return dc_is_hdmi_signal(signal) ||
++	       (dc_is_dp_signal(signal) && signal != SIGNAL_TYPE_EDP);
++}
++
+ #endif /* __AMDGPU_DM_HDR10PLUS_H__ */

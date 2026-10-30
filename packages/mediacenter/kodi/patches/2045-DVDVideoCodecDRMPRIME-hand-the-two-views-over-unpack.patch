@@ -1,0 +1,754 @@
+From a3373f5d6717ea1535bba6c9cd23d938921aa48a Mon Sep 17 00:00:00 2001
+From: Dom Cobley <popcornmix@gmail.com>
+Date: Sat, 5 Sep 2026 15:38:29 +0100
+Subject: [PATCH 2045/2064] DVDVideoCodecDRMPRIME: hand the two views over
+ unpacked
+
+Now that a picture can carry both views and the DRM PRIME renderers can present
+them, there is no reason to pack them first. The decoder's own frames go straight
+to the renderer, so hstack's copy - a whole frame read and a double-width frame
+written, per picture - goes away, and with it the pool of double-width buffers it
+wrote into and the frame of latency its graph added. An unfiltered 3D stream now
+runs with no filter graph at all.
+
+CMultiviewFramePairer keeps the part that was always about pairing - holding a base
+view frame back until the frame after it says whether a dependent view is coming,
+settling the eye order from the bitstream, and turning an orphan into its own
+partner - and hands the pair to the caller instead of pushing it into two buffer
+sources. Feeding a packing graph becomes FeedMultiviewPair() beside it, so the two
+codecs still share it rather than growing a copy each.
+
+Packing stays for a stream that needs a filter chain, because the chain is one
+graph and running the views through it separately would need two. That is not the
+common case - MVC and MV-HEVC are progressive, so nothing asks for a deinterlacer -
+but a stream the decoder does not put out in a format we can hand over needs the
+scale filter, and 10 bit is such a format.
+
+Measured on a Pi 4. Where the decoder was keeping up, playing a 1080p MVC Blu-ray
+costs 163% of a core against 179% packed, 9% less. Where it was not, the packed
+path was quietly making up the difference by dropping: on Coraline it discards
+28% of pictures against 20%, and it needs forty seconds to recover from a seek,
+running thousands of frames late and repeating one about 380 times a second, where
+the unpacked path never falls behind at all.
+
+The dependent view is still decoded in software, so this does not make a 3D disc
+cheap - it stops it being more expensive than it has to be.
+
+(cherry picked from commit c2a8132242c6fc63de3d98c01a858d19a203bdf3)
+---
+ .../DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp | 146 +++++++++++++-----
+ .../DVDCodecs/Video/DVDVideoCodecDRMPRIME.h   |  18 ++-
+ .../DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp   |  42 ++++-
+ .../DVDCodecs/Video/DVDVideoCodecFFmpeg.h     |   4 +-
+ .../DVDCodecs/Video/MultiviewFramePairer.cpp  | 115 +++++++-------
+ .../DVDCodecs/Video/MultiviewFramePairer.h    |  83 +++++-----
+ 6 files changed, 251 insertions(+), 157 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
+index b3f19eca07..8c15a4d101 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
+@@ -100,6 +100,8 @@ CDVDVideoCodecDRMPRIME::CDVDVideoCodecDRMPRIME(CProcessInfo& processInfo)
+ {
+   m_pFrame = av_frame_alloc();
+   m_pFilterFrame = av_frame_alloc();
++  m_pBaseViewFrame = av_frame_alloc();
++  m_pDependentViewFrame = av_frame_alloc();
+   m_hwVideoBufferPool = std::make_shared<CVideoBufferPoolDRMPRIMEFFmpeg>();
+ }
+ 
+@@ -107,6 +109,8 @@ CDVDVideoCodecDRMPRIME::~CDVDVideoCodecDRMPRIME()
+ {
+   av_frame_free(&m_pFrame);
+   av_frame_free(&m_pFilterFrame);
++  av_frame_free(&m_pBaseViewFrame);
++  av_frame_free(&m_pDependentViewFrame);
+   FilterClose();
+   avcodec_free_context(&m_pCodecContext);
+ }
+@@ -233,8 +237,7 @@ enum AVPixelFormat CDVDVideoCodecDRMPRIME::GetFormat(struct AVCodecContext* avct
+   {
+     // A hwaccel is offered here as its own pixel format rather than as its own
+     // decoder, so this is the only place it can be turned down. None of them
+-    // decode the dependent layer of a multiview stream, and the filter graph
+-    // that packs the views needs frames the CPU can read.
++    // decode the dependent layer of a multiview stream.
+     if (ctx->m_multiview && fmt[n] == AV_PIX_FMT_DRM_PRIME)
+       continue;
+ 
+@@ -352,17 +355,17 @@ bool CDVDVideoCodecDRMPRIME::Open(CDVDStreamInfo& hints, CDVDCodecOptions& optio
+   if (hints.multiview)
+   {
+     // Ask for every coded view rather than just the base layer. The views come
+-    // out as separate frames sharing one pts; the filter graph packs them side
+-    // by side into the layout the demuxer already advertised.
++    // out as separate frames sharing one pts, and are handed on a buffer each,
++    // or packed side by side while a filter chain is up.
+     if (av_opt_set(m_pCodecContext, "view_ids", "-1", AV_OPT_SEARCH_CHILDREN) < 0)
+     {
+       CLog::Log(LOGWARNING,
+                 "CDVDVideoCodecDRMPRIME::{} - decoder has no multiview support, playing the base "
+                 "view only",
+                 __FUNCTION__);
+-      // The demuxer advertised the packed layout this decoder was expected to
+-      // produce. It is not going to, so say so rather than let the renderer
+-      // crop half of a single view.
++      // The demuxer advertised a stereoscopic layout this decoder was expected to
++      // produce. It is not going to, so say so rather than let the renderer show
++      // a single view as though it were two.
+       m_stereoMode = "mono";
+     }
+     else
+@@ -372,9 +375,8 @@ bool CDVDVideoCodecDRMPRIME::Open(CDVDStreamInfo& hints, CDVDCodecOptions& optio
+     }
+   }
+ 
+-  // No hwaccel decodes the dependent layer of a multiview stream, and the
+-  // filter graph that packs the views cannot work on hardware frames, so do not
+-  // offer the decoder a hardware device to attach one to.
++  // No hwaccel decodes the dependent layer of a multiview stream, so do not offer
++  // the decoder a hardware device to attach one to.
+   const AVCodecHWConfig* pConfig = m_multiview ? nullptr : FindHWConfig(pCodec);
+   if (pConfig && (pConfig->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX))
+   {
+@@ -609,7 +611,7 @@ void CDVDVideoCodecDRMPRIME::Drain()
+   av_packet_free(&avpkt);
+ }
+ 
+-bool CDVDVideoCodecDRMPRIME::SetPictureParams(VideoPicture* pVideoPicture)
++bool CDVDVideoCodecDRMPRIME::SetPictureParams(VideoPicture* pVideoPicture, AVFrame* dependentView)
+ {
+   // ffmpeg's v4l2m2m resizes without re-invoking our GetFormat callback; republish from the frames.
+   // Here rather than in GetPicture() so that filter graph output is covered too, which reaches
+@@ -712,7 +714,7 @@ bool CDVDVideoCodecDRMPRIME::SetPictureParams(VideoPicture* pVideoPicture)
+     pVideoPicture->hasLightMetadata = true;
+   }
+ 
+-  // Assigned every frame, and empty unless the decoder packs the views itself: the
++  // Assigned every frame, and empty unless the decoder is decoding both views: the
+   // picture is reused from one frame to the next, and CVideoPlayerVideo falls back to
+   // the stream's hint on what it finds here each frame, as it does for
+   // CDVDVideoCodecFFmpeg, so nothing may be left over from the frame before.
+@@ -744,37 +746,68 @@ bool CDVDVideoCodecDRMPRIME::SetPictureParams(VideoPicture* pVideoPicture)
+     pVideoPicture->videoBuffer->Release();
+     pVideoPicture->videoBuffer = nullptr;
+   }
+-
+-  if (m_pFrame->format == AV_PIX_FMT_DRM_PRIME)
++  if (pVideoPicture->videoBuffer2)
+   {
+-    CVideoBufferDRMPRIMEFFmpeg* buffer = m_hwVideoBufferPool->Get();
+-    buffer->SetPictureParams(*pVideoPicture);
+-    buffer->SetRef(m_pFrame);
+-    pVideoPicture->videoBuffer = buffer;
++    pVideoPicture->videoBuffer2->Release();
++    pVideoPicture->videoBuffer2 = nullptr;
+   }
+-  else if (IsSupportedSwFormat(static_cast<AVPixelFormat>(m_pFrame->format)))
+-  {
+-    CVideoBufferDMA* buffer = static_cast<CVideoBufferDMA*>(av_buffer_get_opaque(m_pFrame->buf[0]));
+-    buffer->SetPictureParams(*pVideoPicture);
+-    buffer->Acquire();
+-    buffer->SyncEnd();
+-    buffer->SetDimensions(m_pFrame->width, m_pFrame->height);
+ 
+-    pVideoPicture->videoBuffer = buffer;
+-    av_frame_unref(m_pFrame);
+-  }
++  // Before the buffers are made: each caches a copy of the picture, and this is how a
++  // holder of that copy alone knows the picture had a second view.
++  pVideoPicture->separateViews = dependentView != nullptr;
+ 
+-  if (!pVideoPicture->videoBuffer)
++  pVideoPicture->videoBuffer = BufferFromFrame(m_pFrame, *pVideoPicture);
++  if (dependentView)
++    pVideoPicture->videoBuffer2 = BufferFromFrame(dependentView, *pVideoPicture);
++
++  if (!pVideoPicture->videoBuffer || (dependentView && !pVideoPicture->videoBuffer2))
+   {
+     CLog::Log(LOGERROR, "CDVDVideoCodecDRMPRIME::{} - videoBuffer:nullptr format:{}", __FUNCTION__,
+               m_pFrame->format == AV_PIX_FMT_NONE ? "AV_PIX_FMT_NONE" : av_get_pix_fmt_name(static_cast<AVPixelFormat>(m_pFrame->format)));
+     av_frame_unref(m_pFrame);
++    if (dependentView)
++      av_frame_unref(dependentView);
+     return false;
+   }
+ 
+   return true;
+ }
+ 
++CVideoBuffer* CDVDVideoCodecDRMPRIME::BufferFromFrame(AVFrame* frame, const VideoPicture& picture)
++{
++  if (frame->format == AV_PIX_FMT_DRM_PRIME)
++  {
++    CVideoBufferDRMPRIMEFFmpeg* buffer = m_hwVideoBufferPool->Get();
++    buffer->SetPictureParams(picture);
++    buffer->SetRef(frame);
++    return buffer;
++  }
++
++  if (IsSupportedSwFormat(static_cast<AVPixelFormat>(frame->format)))
++  {
++    CVideoBufferDMA* buffer = static_cast<CVideoBufferDMA*>(av_buffer_get_opaque(frame->buf[0]));
++    buffer->SetPictureParams(picture);
++    buffer->Acquire();
++    buffer->SyncEnd();
++    buffer->SetDimensions(frame->width, frame->height);
++
++    av_frame_unref(frame);
++    return buffer;
++  }
++
++  return nullptr;
++}
++
++bool CDVDVideoCodecDRMPRIME::PictureFromViewPair(VideoPicture* pVideoPicture)
++{
++  // The leading view carries the picture's timing and metadata, so it takes the place
++  // of the frame the decoder would otherwise have left here.
++  av_frame_unref(m_pFrame);
++  av_frame_move_ref(m_pFrame, m_pBaseViewFrame);
++
++  return SetPictureParams(pVideoPicture, m_pDependentViewFrame);
++}
++
+ void CDVDVideoCodecDRMPRIME::FilterTest()
+ {
+   const AVFilter* filter;
+@@ -1099,8 +1132,6 @@ bool CDVDVideoCodecDRMPRIME::FilterOpen(const std::string& filters, bool test)
+     return true;
+   }
+ 
+-  m_multiviewPairer.SetInputs(m_pFilterIn, m_pFilterIn2);
+-
+   if (CServiceBroker::GetLogging().CanLogComponent(LOGVIDEO))
+   {
+     char* graphDump = avfilter_graph_dump(m_pFilterGraph, nullptr);
+@@ -1119,10 +1150,13 @@ void CDVDVideoCodecDRMPRIME::FilterClose()
+ {
+   m_processInfo.SetVideoDeintMethod("none");
+ 
+-  m_multiviewPairer.SetInputs(nullptr, nullptr);
+-
+   if (m_pFilterGraph)
+   {
++    // The held frame was decoded for the packing graph that is going away. Test
++    // graphs never pack, so they must not take it.
++    if (m_pFilterIn2)
++      m_multiviewPairer.DropHeldFrame();
++
+     CLog::Log(LOGDEBUG, LOGVIDEO, "CDVDVideoCodecDRMPRIME::FilterClose - Freeing filter graph");
+     avfilter_graph_free(&m_pFilterGraph);
+ 
+@@ -1168,8 +1202,19 @@ CDVDVideoCodec::VCReturn CDVDVideoCodecDRMPRIME::ProcessFilterIn()
+     av_frame_move_ref(m_pFrame, frame);
+   }
+ 
+-  int ret = m_pFilterIn2 ? m_multiviewPairer.AddFrame(m_pFrame, m_stereoMode)
+-                         : av_buffersrc_add_frame(m_pFilterIn, m_pFrame);
++  // A packing graph is fed a pair at a time: it emits nothing until both of its inputs
++  // have a frame, so a lone view would wedge it.
++  int ret = 0;
++  if (m_pFilterIn2)
++  {
++    if (m_multiviewPairer.AddFrame(m_pFrame, m_stereoMode, m_pBaseViewFrame,
++                                   m_pDependentViewFrame))
++      ret = FeedMultiviewPair(m_pFilterIn, m_pFilterIn2, m_pBaseViewFrame,
++                              m_pDependentViewFrame);
++  }
++  else
++    ret = av_buffersrc_add_frame(m_pFilterIn, m_pFrame);
++
+   if (ret < 0)
+   {
+     char err[AV_ERROR_MAX_STRING_SIZE] = {};
+@@ -1283,9 +1328,16 @@ CDVDVideoCodec::VCReturn CDVDVideoCodecDRMPRIME::GetPicture(VideoPicture* pVideo
+     return VC_BUFFER;
+   else if (ret == AVERROR_EOF)
+   {
+-    // Nothing is coming to partner the frame the multiview graph is holding back.
+-    if (m_multiviewPairer.HasHeldFrame() && m_multiviewPairer.FlushHeldFrame() >= 0)
++    // Nothing is coming to partner the frame the pairer is holding back, so it becomes
++    // its own partner - a picture of its own here, a pair for the graph there.
++    if (m_multiviewPairer.FlushHeldFrame(m_pBaseViewFrame, m_pDependentViewFrame))
++    {
++      if (!m_pFilterIn2)
++        return PictureFromViewPair(pVideoPicture) ? VC_PICTURE : VC_ERROR;
++
++      FeedMultiviewPair(m_pFilterIn, m_pFilterIn2, m_pBaseViewFrame, m_pDependentViewFrame);
+       return VC_NONE;
++    }
+ 
+     if (m_codecControlFlags & DVD_CODEC_CTRL_DRAIN)
+     {
+@@ -1384,9 +1436,10 @@ CDVDVideoCodec::VCReturn CDVDVideoCodecDRMPRIME::GetPicture(VideoPicture* pVideo
+   else if (!IsSupportedHwFormat(pix_fmt) && !(m_pCodecContext->codec->capabilities & AV_CODEC_CAP_DR1))
+     filterChain = "copy";
+ 
+-  // The multiview graph packs the two views together, so it has to stay up for
+-  // the whole stream even when no other filtering is wanted.
+-  if (!filterChain.empty() || m_multiview)
++  // A filtered multiview stream has to be packed: the chain is one graph, and running
++  // the views through it separately would need two. Unfiltered, they go to the renderer
++  // as they are.
++  if (!filterChain.empty())
+   {
+     bool reopenFilter = false;
+     if (m_filters != filterChain || (m_multiview && !m_pFilterGraph))
+@@ -1431,6 +1484,19 @@ CDVDVideoCodec::VCReturn CDVDVideoCodecDRMPRIME::GetPicture(VideoPicture* pVideo
+   {
+     m_filters.clear();
+     FilterClose();
++
++    if (m_multiview)
++    {
++      // The pairer holds a frame back until the frame after it says whether a dependent
++      // view is coming, so a picture is only owed once a pair completes. VC_NONE rather
++      // than VC_BUFFER: the drain loop stops on VC_BUFFER, and the partner is already
++      // sitting in the decoder.
++      if (!m_multiviewPairer.AddFrame(m_pFrame, m_stereoMode, m_pBaseViewFrame,
++                                      m_pDependentViewFrame))
++        return VC_NONE;
++
++      return PictureFromViewPair(pVideoPicture) ? VC_PICTURE : VC_ERROR;
++    }
+   }
+ 
+   if (!SetPictureParams(pVideoPicture))
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.h
+index 23ca03b3a2..8adb76e153 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.h
+@@ -48,7 +48,14 @@ public:
+ 
+ protected:
+   void Drain();
+-  bool SetPictureParams(VideoPicture* pVideoPicture);
++  //! \brief Fill the picture from m_pFrame, and from \p dependentView when the views are
++  //!        handed over separately. Both frames are taken.
++  bool SetPictureParams(VideoPicture* pVideoPicture, AVFrame* dependentView = nullptr);
++  //! \brief Take the buffer behind a decoded frame, leaving the frame empty. Null if
++  //!        the frame is in a format this codec does not hand out.
++  CVideoBuffer* BufferFromFrame(AVFrame* frame, const VideoPicture& picture);
++  //! \brief Make the picture from the pair the pairer has just completed.
++  bool PictureFromViewPair(VideoPicture* pVideoPicture);
+   void UpdateProcessInfo(struct AVCodecContext* avctx, const enum AVPixelFormat fmt);
+   CDVDVideoCodec::VCReturn ProcessFilterIn();
+   CDVDVideoCodec::VCReturn ProcessFilterOut();
+@@ -75,10 +82,13 @@ protected:
+   AVFilterContext* m_pFilterIn2 = nullptr; //!< second view of a multiview stream
+   AVFilterContext* m_pFilterOut = nullptr;
+ 
+-  //! Eyes are coded as separate views and are packed side by side by the filter graph.
++  //! Eyes are coded as separate views. They are handed to the renderer a buffer each,
++  //! except while a filter chain is up, which needs them packed into one frame.
+   bool m_multiview = false;
+-  CMultiviewFramePairer m_multiviewPairer; //!< routes the views to the graph's two inputs
+-  std::string m_stereoMode; //!< mode the packed frame is in, empty when not stereoscopic
++  CMultiviewFramePairer m_multiviewPairer; //!< pairs up the views of an access unit
++  AVFrame* m_pBaseViewFrame = nullptr; //!< scratch for the leading view of a pair
++  AVFrame* m_pDependentViewFrame = nullptr; //!< scratch for the other view of a pair
++  std::string m_stereoMode; //!< eye order of a stereoscopic stream, empty when not one
+ 
+   std::shared_ptr<CVideoBufferPoolDRMPRIMEFFmpeg> m_hwVideoBufferPool;
+ 
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+index 837045fde1..7826997f36 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+@@ -449,6 +449,19 @@ bool CDVDVideoCodecFFmpeg::Open(CDVDStreamInfo &hints, CDVDCodecOptions &options
+     return false;
+   }
+ 
++  m_pBaseViewFrame = av_frame_alloc();
++  m_pDependentViewFrame = av_frame_alloc();
++  if (!m_pBaseViewFrame || !m_pDependentViewFrame)
++  {
++    av_frame_free(&m_pFrame);
++    av_frame_free(&m_pDecodedFrame);
++    av_frame_free(&m_pFilterFrame);
++    av_frame_free(&m_pBaseViewFrame);
++    av_frame_free(&m_pDependentViewFrame);
++    avcodec_free_context(&m_pCodecContext);
++    return false;
++  }
++
+   UpdateName();
+   const char* pixFmtName = av_get_pix_fmt_name(m_pCodecContext->pix_fmt);
+   m_processInfo.SetVideoDimensions(m_pCodecContext->coded_width, m_pCodecContext->coded_height);
+@@ -464,6 +477,8 @@ void CDVDVideoCodecFFmpeg::Dispose()
+   av_frame_free(&m_pFrame);
+   av_frame_free(&m_pDecodedFrame);
+   av_frame_free(&m_pFilterFrame);
++  av_frame_free(&m_pBaseViewFrame);
++  av_frame_free(&m_pDependentViewFrame);
+   avcodec_free_context(&m_pCodecContext);
+ 
+   if (m_pHardware)
+@@ -1421,8 +1436,6 @@ int CDVDVideoCodecFFmpeg::FilterOpen(const std::string& filters, bool scale)
+     return result;
+   }
+ 
+-  m_multiviewPairer.SetInputs(m_pFilterIn, m_pFilterIn2);
+-
+   if (CServiceBroker::GetLogging().CanLogComponent(LOGVIDEO))
+   {
+     char* graphDump = avfilter_graph_dump(m_pFilterGraph, nullptr);
+@@ -1439,10 +1452,13 @@ int CDVDVideoCodecFFmpeg::FilterOpen(const std::string& filters, bool scale)
+ 
+ void CDVDVideoCodecFFmpeg::FilterClose()
+ {
+-  m_multiviewPairer.SetInputs(nullptr, nullptr);
+-
+   if (m_pFilterGraph)
+   {
++    // The held frame was decoded for the packing graph that is going away. Test
++    // graphs never pack, so they must not take it.
++    if (m_pFilterIn2)
++      m_multiviewPairer.DropHeldFrame();
++
+     CLog::Log(LOGDEBUG, LOGVIDEO, "CDVDVideoCodecFFmpeg::FilterClose - Freeing filter graph");
+     avfilter_graph_free(&m_pFilterGraph);
+ 
+@@ -1459,11 +1475,21 @@ CDVDVideoCodec::VCReturn CDVDVideoCodecFFmpeg::FilterProcess(AVFrame* frame)
+ 
+   if (frame || (m_codecControlFlags & DVD_CODEC_CTRL_DRAIN))
+   {
+-    // A multiview graph is fed through the pairer, which holds a base view frame back
+-    // until it knows whether a dependent view is coming, and drains both of its inputs.
++    // A multiview graph is fed a pair at a time: it emits nothing until both of its
++    // inputs have a frame, so a lone view would wedge it.
+     if (m_pFilterIn2)
+-      result =
+-          frame ? m_multiviewPairer.AddFrame(frame, m_stereoMode) : m_multiviewPairer.Drain();
++    {
++      result = 0;
++      const bool paired =
++          frame ? m_multiviewPairer.AddFrame(frame, m_stereoMode, m_pBaseViewFrame,
++                                             m_pDependentViewFrame)
++                : m_multiviewPairer.FlushHeldFrame(m_pBaseViewFrame, m_pDependentViewFrame);
++      if (paired)
++        result = FeedMultiviewPair(m_pFilterIn, m_pFilterIn2, m_pBaseViewFrame,
++                                   m_pDependentViewFrame);
++      if (!frame && result >= 0)
++        result = DrainMultiviewInputs(m_pFilterIn, m_pFilterIn2);
++    }
+     else
+       result = av_buffersrc_add_frame(m_pFilterIn, frame);
+ 
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.h
+index 1120ac954c..6ba22b8f8b 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.h
+@@ -82,7 +82,9 @@ protected:
+ 
+   //! Eyes are coded as separate views and are packed side by side by the filter graph.
+   bool m_multiview = false;
+-  CMultiviewFramePairer m_multiviewPairer; //!< routes the views to the graph's two inputs
++  CMultiviewFramePairer m_multiviewPairer; //!< pairs up the views of an access unit
++  AVFrame* m_pBaseViewFrame = nullptr; //!< scratch for the leading view of a pair
++  AVFrame* m_pDependentViewFrame = nullptr; //!< scratch for the other view of a pair
+   std::string m_stereoMode; //!< mode the packed frame is in, empty when not stereoscopic
+ 
+   std::unique_ptr<IDVDVideoPP> m_postProc;
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/MultiviewFramePairer.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/MultiviewFramePairer.cpp
+index 4cf758f41d..7991c00e2c 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/MultiviewFramePairer.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/MultiviewFramePairer.cpp
+@@ -23,35 +23,37 @@ CMultiviewFramePairer::~CMultiviewFramePairer()
+   av_frame_free(&m_held);
+ }
+ 
+-void CMultiviewFramePairer::SetInputs(AVFilterContext* base, AVFilterContext* dependent)
++void CMultiviewFramePairer::Reset()
+ {
+   av_frame_free(&m_held);
+-  m_base = base;
+-  m_dependent = dependent;
++  m_baseViewId = -1;
+ }
+ 
+-void CMultiviewFramePairer::Reset()
++void CMultiviewFramePairer::DropHeldFrame()
+ {
+   av_frame_free(&m_held);
+-  m_baseViewId = -1;
+ }
+ 
+-int CMultiviewFramePairer::AddFrame(AVFrame* frame, std::string& stereoMode)
++bool CMultiviewFramePairer::AddFrame(AVFrame* frame,
++                                     std::string& stereoMode,
++                                     AVFrame* base,
++                                     AVFrame* dependent)
+ {
+-#if !FFMPEG_HAVE_MULTIVIEW
+-  return av_buffersrc_add_frame(m_base, frame);
+-#else
++  int viewId = -1;
++  bool tagged = false;
++#if FFMPEG_HAVE_MULTIVIEW
+   const AVFrameSideData* sd = av_frame_get_side_data(frame, AV_FRAME_DATA_VIEW_ID);
+-  const bool tagged = sd && sd->size >= sizeof(int);
+-  const int viewId = tagged ? *reinterpret_cast<const int*>(sd->data) : -1;
++  tagged = sd && sd->size >= sizeof(int);
++  if (tagged)
++    viewId = *reinterpret_cast<const int*>(sd->data);
++#endif
+ 
+   if (tagged && m_baseViewId < 0)
+   {
+     m_baseViewId = viewId;
+ 
+-    // The first view out of the decoder goes in the left half. If the bitstream says that
+-    // view is the right eye, tell the renderer the halves are swapped rather than reorder
+-    // the graph inputs.
++    // The first view out of the decoder leads. If the bitstream says that view is the
++    // right eye, tell the renderer the eyes are swapped rather than reorder the views.
+     const AVFrameSideData* stereo = av_frame_get_side_data(frame, AV_FRAME_DATA_STEREO3D);
+     if (stereo && stereo->size >= sizeof(AVStereo3D))
+     {
+@@ -78,92 +80,79 @@ int CMultiviewFramePairer::AddFrame(AVFrame* frame, std::string& stereoMode)
+     {
+       // A dependent view frame with no base view frame to go with it.
+       av_frame_unref(frame);
+-      return 0;
++      return false;
+     }
+ 
+-    AVFrame* held = m_held;
+-    m_held = nullptr;
+-    return FeedPair(held, frame);
++    av_frame_move_ref(base, m_held);
++    av_frame_free(&m_held);
++    av_frame_move_ref(dependent, frame);
++    return true;
+   }
+ 
+   // Whatever was held from last time has been overtaken, so it is never getting a partner.
+-  int ret = FlushHeldFrame();
+-  if (ret < 0)
+-  {
+-    av_frame_unref(frame);
+-    return ret;
+-  }
++  const bool orphan = FlushHeldFrame(base, dependent);
+ 
+   m_held = av_frame_alloc();
+   if (!m_held)
+   {
+     av_frame_unref(frame);
+-    return AVERROR(ENOMEM);
++    return orphan;
+   }
+ 
+   av_frame_move_ref(m_held, frame);
+-  return 0;
+-#endif
++  return orphan;
+ }
+ 
+-int CMultiviewFramePairer::FeedPair(AVFrame* base, AVFrame* dependent)
++bool CMultiviewFramePairer::FlushHeldFrame(AVFrame* base, AVFrame* dependent)
+ {
+-  int ret = av_buffersrc_add_frame(m_base, base);
+-  av_frame_free(&base);
+-  if (ret < 0)
++  if (!m_held)
++    return false;
++
++  AVFrame* copy = av_frame_clone(m_held);
++  if (!copy)
+   {
+-    av_frame_unref(dependent);
+-    return ret;
++    av_frame_free(&m_held);
++    return false;
+   }
+ 
+-  return av_buffersrc_add_frame(m_dependent, dependent);
++  av_frame_move_ref(base, m_held);
++  av_frame_free(&m_held);
++  av_frame_move_ref(dependent, copy);
++  av_frame_free(&copy);
++  return true;
+ }
+ 
+-int CMultiviewFramePairer::FlushHeldFrame()
++int FeedMultiviewPair(AVFilterContext* base,
++                      AVFilterContext* dependent,
++                      AVFrame* baseFrame,
++                      AVFrame* dependentFrame)
+ {
+-  if (!m_held)
+-    return 0;
+-
+-  AVFrame* held = m_held;
+-  m_held = nullptr;
+-
+-  if (!m_base || !m_dependent)
++  if (!base || !dependent)
+   {
+-    av_frame_free(&held);
++    av_frame_unref(baseFrame);
++    av_frame_unref(dependentFrame);
+     return 0;
+   }
+ 
+-  AVFrame* copy = av_frame_clone(held);
+-
+-  int ret = av_buffersrc_add_frame(m_base, held);
+-  av_frame_free(&held);
++  int ret = av_buffersrc_add_frame(base, baseFrame);
+   if (ret < 0)
+   {
+-    av_frame_free(&copy);
++    av_frame_unref(baseFrame);
++    av_frame_unref(dependentFrame);
+     return ret;
+   }
+ 
+-  if (!copy)
+-    return AVERROR(ENOMEM);
+-
+-  ret = av_buffersrc_add_frame(m_dependent, copy);
+-  av_frame_free(&copy);
+-  return ret;
++  return av_buffersrc_add_frame(dependent, dependentFrame);
+ }
+ 
+-int CMultiviewFramePairer::Drain()
++int DrainMultiviewInputs(AVFilterContext* base, AVFilterContext* dependent)
+ {
+-  int ret = FlushHeldFrame();
+-  if (ret < 0)
+-    return ret;
+-
+-  if (!m_base || !m_dependent)
++  if (!base || !dependent)
+     return 0;
+ 
+-  // Both inputs have to see the end of the stream, or the sink never reports it.
+-  ret = av_buffersrc_add_frame(m_dependent, nullptr);
++  int ret = av_buffersrc_add_frame(dependent, nullptr);
+   if (ret < 0)
+     return ret;
+ 
+-  return av_buffersrc_add_frame(m_base, nullptr);
++  return av_buffersrc_add_frame(base, nullptr);
+ }
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/MultiviewFramePairer.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/MultiviewFramePairer.h
+index 793ad58f6f..f7c2c006ea 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/MultiviewFramePairer.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/MultiviewFramePairer.h
+@@ -17,66 +17,67 @@ extern "C"
+ }
+ 
+ /*!
+- * \brief Feed the two views of a multiview access unit to the two inputs of the filter graph
+- *        that packs them side by side.
++ * \brief Pair up the two views of a multiview access unit as they come out of the decoder.
+  *
+  * A decoder asked for every view hands the views of an access unit back as separate frames
+- * sharing a pts, each tagged with its view id. hstack pairs its inputs frame for frame and
+- * emits nothing until both have arrived, so the graph must never be left with a frame on one
+- * input and nothing coming on the other: the decoder tags base view frames with view 0
+- * whether or not a dependent view follows, and when the second eye stops - a 2D play item
+- * of a 3D disc, a dependent clip that would not open - frames queue behind the filter until
+- * memory runs out.
++ * sharing a pts, each tagged with its view id. Consumers want them a pair at a time - a
++ * renderer taking an eye per buffer, or a filter graph packing them side by side, which
++ * emits nothing until both of its inputs have a frame.
+  *
+- * Whether a frame has a partner is not knowable until the next frame turns up, so each base
+- * view frame is held back and the frame after it decides: a dependent view frame completes
+- * the pair, anything else means the held frame is on its own and it goes to both inputs as
+- * its own partner. One held frame always yields exactly one pair, so the eyes stay paired
+- * across the transition either way. Costs one frame of latency in the filter stage.
++ * Whether a frame has a partner is not knowable until the next frame turns up: the decoder
++ * tags base view frames with view 0 whether or not a dependent view follows, and the second
++ * eye can stop at any time - a 2D play item of a 3D disc, a dependent clip that would not
++ * open. So each base view frame is held back and the frame after it decides: a dependent
++ * view frame completes the pair, anything else means the held frame is on its own and it
++ * becomes its own partner. One held frame always yields exactly one pair, so the eyes stay
++ * paired across the transition either way. Costs one frame of latency.
+  */
+ class CMultiviewFramePairer
+ {
+ public:
+   ~CMultiviewFramePairer();
+ 
+-  /*!
+-   * \brief The graph inputs to feed. Drops any held frame, which belonged to the old graph.
+-   * \param base the buffer source for the view that goes in the left half
+-   * \param dependent the buffer source for the other view
+-   */
+-  void SetInputs(AVFilterContext* base, AVFilterContext* dependent);
+-
+   //! \brief Forget which view is the base view and drop any held frame, for a decoder reset.
+   void Reset();
+ 
++  //! \brief Drop any held frame, for a decode chain that is being rebuilt under it.
++  void DropHeldFrame();
++
+   /*!
+-   * \brief Route a decoded frame to its input. Takes the frame's reference, leaving it empty.
+-   * \param frame the decoded frame, left blank on return whether or not this succeeds
+-   * \param stereoMode overwritten with the packed layout the bitstream's own view
+-   *        information gives ("left_right" or "right_left") once it is known, otherwise
+-   *        left as it is
+-   * \return 0 or an AVERROR
++   * \brief Offer a decoded frame. Takes the frame's reference, leaving it empty.
++   * \param frame the decoded frame, left blank on return whether or not this pairs
++   * \param stereoMode overwritten with the layout the bitstream's own view information
++   *        gives ("left_right" or "right_left") once it is known, otherwise left as it is
++   * \param base receives the view that leads, when a pair completes
++   * \param dependent receives the other view, when a pair completes
++   * \return true when \p base and \p dependent hold a pair, which is then the caller's
+    */
+-  int AddFrame(AVFrame* frame, std::string& stereoMode);
++  bool AddFrame(AVFrame* frame, std::string& stereoMode, AVFrame* base, AVFrame* dependent);
+ 
+-  //! \brief Feed a held frame to both inputs as its own partner. 0 when nothing is held.
+-  int FlushHeldFrame();
+-
+-  bool HasHeldFrame() const { return m_held != nullptr; }
+-
+-  //! \brief End the stream on both inputs, after flushing any held frame.
+-  int Drain();
++  /*!
++   * \brief Release a held frame as its own partner, for the end of a stream.
++   * \return true when one was held, and \p base and \p dependent are the caller's
++   */
++  bool FlushHeldFrame(AVFrame* base, AVFrame* dependent);
+ 
+ private:
+-  //! \brief Feed a pair: \p base is freed, \p dependent is left empty.
+-  int FeedPair(AVFrame* base, AVFrame* dependent);
+-
+-  AVFilterContext* m_base{nullptr};
+-  AVFilterContext* m_dependent{nullptr};
+-
+-  //! View id of the view that goes in the left half, -1 until a tagged frame has been seen.
++  //! View id of the view that leads, -1 until a tagged frame has been seen.
+   int m_baseViewId{-1};
+ 
+   //! Base view frame waiting to be told whether it has a partner.
+   AVFrame* m_held{nullptr};
+ };
++
++/*!
++ * \brief Feed a completed pair to the two buffer sources of a graph that packs the views.
++ * \param baseFrame the view for the graph's first input, left empty whatever happens
++ * \param dependentFrame the view for its second input, left empty whatever happens
++ * \return 0 or an AVERROR
++ */
++int FeedMultiviewPair(AVFilterContext* base,
++                      AVFilterContext* dependent,
++                      AVFrame* baseFrame,
++                      AVFrame* dependentFrame);
++
++//! \brief End the stream on both buffer sources, or the sink never reports it.
++int DrainMultiviewInputs(AVFilterContext* base, AVFilterContext* dependent);
+-- 
+2.56.0
+

@@ -1,0 +1,138 @@
+From: cinemaONE <35371193+cinema-ONE@users.noreply.github.com>
+Subject: [PATCH] drm/amd/display: send the HDR10+ packet with the flip
+
+0129 commits a changed HDR10PLUS_VSIF in its own stream update before
+the flip is programmed, so about half of the flips that carry a new
+packet miss their vblank. When a plane of the CRTC is in the commit,
+carry the packet in the flip's own stream update instead: one fast
+update. Our own code, MIT.
+---
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index fe20c75..42596e8 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -4099,6 +4099,62 @@ bool amdgpu_dm_dvbridge_dcn_reviewed(const struct amdgpu_device *adev)
+ }
+ 
+ 
++/* Hades: the links that carry HDR10PLUS_VSIF (amdgpu_dm_hdr10plus.h) */
++static bool amdgpu_dm_hdr10plus_link(enum signal_type signal)
++{
++	return dc_is_hdmi_signal(signal) ||
++	       (dc_is_dp_signal(signal) && signal != SIGNAL_TYPE_EDP);
++}
++
++/*
++ * Hades: the HDR10+ packet of a connector state for a stream's link (amdgpu_dm_hdr10plus.h):
++ * invalid without HDR10PLUS_VSIF, and on a link that does not carry it, which the atomic check
++ * refuses on a stream that exists.
++ */
++static void amdgpu_dm_fill_hdr10plus(const struct drm_connector_state *state,
++				     enum signal_type signal, struct dc_info_packet *out)
++{
++	const struct drm_property_blob *blob = state->hdr10plus_vsif;
++
++	memset(out, 0, sizeof(*out));
++	if (!blob || !amdgpu_dm_hdr10plus_link(signal))
++		return;
++	amdgpu_dm_hdr10plus_packet(blob->data, blob->length, dc_is_hdmi_signal(signal), out);
++}
++
++
++/* A changed HDR10+ packet goes out with the flip when a plane of the CRTC is in the commit. */
++static bool amdgpu_dm_hdr10plus_with_flip(struct drm_atomic_commit *state, struct drm_crtc *crtc)
++{
++	struct drm_plane_state *new_plane_state;
++	struct drm_plane *plane;
++	int i;
++
++	for_each_new_plane_in_state(state, plane, new_plane_state, i)
++		if (plane->type != DRM_PLANE_TYPE_CURSOR && new_plane_state->crtc == crtc &&
++		    new_plane_state->fb)
++			return true;
++	return false;
++}
++
++static bool amdgpu_dm_hdr10plus_changed(struct drm_atomic_commit *state, struct drm_crtc *crtc,
++					enum signal_type signal, struct dc_info_packet *out)
++{
++	struct drm_connector_state *old_con_state, *new_con_state;
++	struct drm_connector *connector;
++	int i;
++
++	for_each_oldnew_connector_in_state(state, connector, old_con_state, new_con_state, i) {
++		if (new_con_state->crtc != crtc ||
++		    drm_connector_atomic_hdr10plus_vsif_equal(old_con_state, new_con_state))
++			continue;
++		amdgpu_dm_fill_hdr10plus(new_con_state, signal, out);
++		return true;
++	}
++	return false;
++}
++
++
+ static void amdgpu_dm_commit_planes(struct drm_atomic_commit *state,
+ 				    struct drm_device *dev,
+ 				    struct amdgpu_display_manager *dm,
+@@ -4131,6 +4187,7 @@ static void amdgpu_dm_commit_planes(struct drm_atomic_commit *state,
+ 		struct dc_scaling_info scaling_infos[MAX_SURFACES];
+ 		struct dc_flip_addrs flip_addrs[MAX_SURFACES];
+ 		struct dc_stream_update stream_update;
++		struct dc_info_packet hdr10plus_packet;
+ 	} *bundle;
+ 
+ 	bundle = kzalloc_obj(*bundle);
+@@ -4405,6 +4462,12 @@ static void amdgpu_dm_commit_planes(struct drm_atomic_commit *state,
+ 			bundle->stream_update.dither_option = &acrtc_state->stream->dither_option;
+ 		}
+ 
++		if (!drm_atomic_crtc_needs_modeset(new_pcrtc_state) &&
++		    amdgpu_dm_hdr10plus_with_flip(state, pcrtc) &&
++		    amdgpu_dm_hdr10plus_changed(state, pcrtc, acrtc_state->stream->signal,
++						&bundle->hdr10plus_packet))
++			bundle->stream_update.hdr10plus_infopacket = &bundle->hdr10plus_packet;
++
+ 		if (new_pcrtc_state->color_mgmt_changed) {
+ 			/*
+ 			 * TODO: This isn't fully correct since we've actually
+@@ -5444,7 +5507,8 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_commit *state)
+ 
+ 		/* Hades: HDR10PLUS_VSIF, the packet of this frame (amdgpu_dm_hdr10plus.h) */
+ 		hdr10plus_changed = dm_new_crtc_state->stream &&
+-			!drm_connector_atomic_hdr10plus_vsif_equal(old_con_state, new_con_state);
++			!drm_connector_atomic_hdr10plus_vsif_equal(old_con_state, new_con_state) &&
++			!amdgpu_dm_hdr10plus_with_flip(state, &acrtc->base);
+ 
+ 		if (!scaling_changed && !abm_changed && !hdr_changed && !output_color_space_changed &&
+ 		    !hdr10plus_changed)
+@@ -5738,30 +5802,6 @@ static int do_aquire_global_lock(struct drm_device *dev,
+ 	return ret < 0 ? ret : 0;
+ }
+ 
+-/* Hades: the links that carry HDR10PLUS_VSIF (amdgpu_dm_hdr10plus.h) */
+-static bool amdgpu_dm_hdr10plus_link(enum signal_type signal)
+-{
+-	return dc_is_hdmi_signal(signal) ||
+-	       (dc_is_dp_signal(signal) && signal != SIGNAL_TYPE_EDP);
+-}
+-
+-/*
+- * Hades: the HDR10+ packet of a connector state for a stream's link (amdgpu_dm_hdr10plus.h):
+- * invalid without HDR10PLUS_VSIF, and on a link that does not carry it, which the atomic check
+- * refuses on a stream that exists.
+- */
+-static void amdgpu_dm_fill_hdr10plus(const struct drm_connector_state *state,
+-				     enum signal_type signal, struct dc_info_packet *out)
+-{
+-	const struct drm_property_blob *blob = state->hdr10plus_vsif;
+-
+-	memset(out, 0, sizeof(*out));
+-	if (!blob || !amdgpu_dm_hdr10plus_link(signal))
+-		return;
+-	amdgpu_dm_hdr10plus_packet(blob->data, blob->length, dc_is_hdmi_signal(signal), out);
+-}
+-
+-
+ static int dm_update_crtc_state(struct amdgpu_display_manager *dm,
+ 			 struct drm_atomic_commit *state,
+ 			 struct drm_crtc *crtc,

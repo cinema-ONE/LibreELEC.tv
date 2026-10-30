@@ -1,0 +1,39 @@
+From 1ba2eb44e57e85a699b9e53b0d8be48f8b1ad35f Mon Sep 17 00:00:00 2001
+From: cinemaONE <35371193+cinema-ONE@users.noreply.github.com>
+Date: Sun, 20 Sep 2026 14:14:17 +0200
+Subject: [PATCH 2056/2064] DRMPRIME: do not install the RPi-only buffersink
+ frame allocator
+
+av_buffersink_set_alloc_video_frame() is not an upstream ffmpeg symbol. It is
+added by LibreELEC's packages/multimedia/ffmpeg/patches/rpi/0001-rpi.patch,
+which is only applied when PROJECT=RPi, so the DRMPRIME filter support fails to
+compile on every other project, Generic included.
+
+The call installs a custom frame allocator so filtered frames come from the
+codec's own pool. Without it libavfilter allocates them itself, which is what
+every non-RPi build would do anyway. The member it installs is left in place.
+
+(cherry picked from commit 986b2d4fe26c60287e9886ec090a161e0d33561c)
+---
+ .../VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp    | 5 -----
+ 1 file changed, 5 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
+index 8c15a4d101..8e95f712b1 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
+@@ -1072,11 +1072,6 @@ bool CDVDVideoCodecDRMPRIME::FilterOpen(const std::string& filters, bool test)
+     return false;
+   }
+ 
+-  if ((result = av_buffersink_set_alloc_video_frame(m_pFilterOut, alloc_filter_frame, static_cast<void*>(this))) < 0)
+-  {
+-    CLog::Log(LOGERROR, "CDVDVideoCodecDRMPRIME::FilterOpen - av_buffersink_set_alloc_video_frame = {}", result);
+-    return result;
+-  }
+   AVFilterInOut* outputs = avfilter_inout_alloc();
+   AVFilterInOut* inputs  = avfilter_inout_alloc();
+ 
+-- 
+2.56.0
+

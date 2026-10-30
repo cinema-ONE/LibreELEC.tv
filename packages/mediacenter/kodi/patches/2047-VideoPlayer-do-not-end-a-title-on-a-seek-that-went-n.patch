@@ -1,0 +1,119 @@
+From 84a699cf02429e86bc911b526f1a4d203b7b20e5 Mon Sep 17 00:00:00 2001
+From: Dom Cobley <popcornmix@gmail.com>
+Date: Sun, 13 Sep 2026 12:32:03 +0100
+Subject: [PATCH 2047/2064] VideoPlayer: do not end a title on a seek that went
+ nowhere
+
+Seek into some Blu-rays and the film stops as though it had reached the end.
+John Carter does it half an hour in; a remux of the same disc, seeked to the
+same place, does not.
+
+The seek is reported as having worked. libbluray's clip seek fails -- the file
+seek inside it returns an error -- but it only warns, keeps the position it had
+calculated and returns that, so bd_seek_time() succeeds and every layer above
+believes it. The flush that goes with the seek leaves nothing behind, the first
+read after it says end of file, and Process() has no way to tell that from a
+stream which has genuinely run out. So it ends the title.
+
+Give it a way to tell. A seek is always followed by a flush, so a read that
+fails before a single packet has arrived is the seek's doing rather than the
+stream's. Remember where playback was when the seek was asked for and go back
+there instead of ending. Once only: if there is nothing to be read there
+either, the title ends as it did before.
+
+A seek to the very end of a title now returns to where it came from, on the
+rare occasion that it lands with nothing at all left to read.
+
+(cherry picked from commit f6233e23a6512d8e90146460cd8816897f5343cd)
+---
+ xbmc/cores/VideoPlayer/VideoPlayer.cpp | 36 ++++++++++++++++++++++++++
+ xbmc/cores/VideoPlayer/VideoPlayer.h   |  5 ++++
+ 2 files changed, 41 insertions(+)
+
+diff --git a/xbmc/cores/VideoPlayer/VideoPlayer.cpp b/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+index ceab5b1bf2..99fb0c52b4 100644
+--- a/xbmc/cores/VideoPlayer/VideoPlayer.cpp
++++ b/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+@@ -782,6 +782,7 @@ CVideoPlayer::CVideoPlayer(IPlayerCallback& callback)
+ 
+   m_bAbortRequest = false;
+   m_offset_pts = 0.0;
++  m_seekRecoverTime = DVD_NOPTS_VALUE;
+   m_playSpeed = DVD_PLAYSPEED_NORMAL;
+   m_streamPlayerSpeed = DVD_PLAYSPEED_NORMAL;
+   m_caching = CACHESTATE_DONE;
+@@ -1465,6 +1466,7 @@ void CVideoPlayer::Prepare()
+   m_CurrentAudioID3.hint.Clear();
+   m_SpeedState.Reset(DVD_NOPTS_VALUE);
+   m_offset_pts = 0;
++  m_seekRecoverTime = DVD_NOPTS_VALUE;
+   m_CurrentAudio.lastdts = DVD_NOPTS_VALUE;
+   m_CurrentVideo.lastdts = DVD_NOPTS_VALUE;
+ 
+@@ -1841,6 +1843,34 @@ void CVideoPlayer::Process()
+         continue;
+       }
+ 
++      // A seek that landed somewhere unreadable is indistinguishable from the end of the
++      // stream: the flush that went with it left nothing behind, and the first read after it
++      // says end of file. libbluray leaves a disc there whenever a clip seek fails - it warns,
++      // moves the position anyway, and what it moved to cannot be read. Go back to where
++      // playback was instead of ending the title, and only once, so that a position which is
++      // genuinely the end still ends it.
++      if (m_seekRecoverTime != DVD_NOPTS_VALUE && m_pDemuxer && m_CurrentVideo.packets == 0 &&
++          m_CurrentAudio.packets == 0)
++      {
++        const double recover{m_seekRecoverTime};
++        m_seekRecoverTime = DVD_NOPTS_VALUE;
++
++        CLog::Log(LOGWARNING, "{} - nothing could be read where the seek landed, returning to "
++                              "{:f}",
++                  __FUNCTION__, recover);
++
++        double start{DVD_NOPTS_VALUE};
++        if (m_pDemuxer->SeekTime(recover, true, &start))
++        {
++          if (start == DVD_NOPTS_VALUE)
++            start = DVD_MSEC_TO_TIME(recover) - m_State.time_offset;
++
++          m_State.dts = start;
++          FlushBuffers(start, true, true);
++          continue;
++        }
++      }
++
+       if (!m_pInputStream->IsEOF())
+         CLog::Log(LOGINFO, "{} - eof reading from demuxer", __FUNCTION__);
+ 
+@@ -3193,6 +3223,12 @@ void CVideoPlayer::HandleMessages()
+       if (m_pInputStream->GetIPosTime() == nullptr)
+         time -= m_State.time_offset/1000l;
+ 
++      // Where playback is now, in the same terms as the seek itself, so that a seek landing
++      // somewhere that cannot be read can return to it - see Process().
++      m_seekRecoverTime = (m_clock.GetClock() + m_State.time_offset) / 1000l;
++      if (m_pInputStream->GetIPosTime() == nullptr)
++        m_seekRecoverTime -= m_State.time_offset / 1000l;
++
+       CLog::Log(LOGDEBUG, "demuxer seek to: {:f}", time);
+       if (m_pDemuxer && m_pDemuxer->SeekTime(time, msg.GetBackward(), &start))
+       {
+diff --git a/xbmc/cores/VideoPlayer/VideoPlayer.h b/xbmc/cores/VideoPlayer/VideoPlayer.h
+index 8928484662..cbf4dc6dfd 100644
+--- a/xbmc/cores/VideoPlayer/VideoPlayer.h
++++ b/xbmc/cores/VideoPlayer/VideoPlayer.h
+@@ -634,6 +634,11 @@ protected:
+     }
+   } m_SpeedState;
+ 
++  /*! Where playback was when the last seek was asked for, or DVD_NOPTS_VALUE once it has
++      been used or there is nothing to go back to. A seek that lands somewhere unreadable
++      reads as the end of the stream, and this is what Process() returns to instead. */
++  double m_seekRecoverTime{DVD_NOPTS_VALUE};
++
+   /*! What CheckContinuity() has taken off the demuxer's timestamps to keep the player
+       clock monotonic. Read by the render thread (see GetSubtitlePlaneOffset), so atomic. */
+   std::atomic<double> m_offset_pts{0.0};
+-- 
+2.56.0
+

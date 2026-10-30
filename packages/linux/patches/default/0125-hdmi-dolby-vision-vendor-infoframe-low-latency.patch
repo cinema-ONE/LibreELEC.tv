@@ -1,0 +1,32 @@
+From: cinemaONE <35371193+cinema-ONE@users.noreply.github.com>
+Subject: [PATCH] video/hdmi: low-latency bit of the Dolby Vision vendor InfoFrame
+
+Dolby Vision Low-Latency (linux-9975/9976 of LibreELEC Hades) sends the
+Dolby VSIF with the low-latency bit set next to the Dolby Vision signal
+bit. Add it to the packer of 0121. Our own code, MIT like hdmi.c.
+---
+diff --git a/drivers/video/hdmi.c b/drivers/video/hdmi.c
+index 164c0f9..aae0ff5 100644
+--- a/drivers/video/hdmi.c
++++ b/drivers/video/hdmi.c
+@@ -720,6 +720,8 @@ ssize_t hdmi_dolby_vendor_infoframe_pack(const struct hdmi_dolby_vendor_infofram
+ 
+ 	if (frame->signal)
+ 		ptr[7] |= BIT(1);
++	if (frame->low_latency)
++		ptr[7] |= BIT(0);
+ 
+ 	hdmi_infoframe_set_checksum(buffer, length);
+ 
+diff --git a/include/linux/hdmi.h b/include/linux/hdmi.h
+index 9ef9bad..41cb222 100644
+--- a/include/linux/hdmi.h
++++ b/include/linux/hdmi.h
+@@ -422,6 +422,7 @@ struct hdmi_dolby_vendor_infoframe {
+ 	unsigned char version;
+ 	unsigned char length;
+ 	bool signal;
++	bool low_latency;
+ };
+ 
+ void hdmi_dolby_vendor_infoframe_init(struct hdmi_dolby_vendor_infoframe *frame);

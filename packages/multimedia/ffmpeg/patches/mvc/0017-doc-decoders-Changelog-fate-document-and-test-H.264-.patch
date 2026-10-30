@@ -1,0 +1,334 @@
+From 10e72bf576c553cdb9f637ae8e1f67482b718eb9 Mon Sep 17 00:00:00 2001
+From: Dom Cobley <popcornmix@gmail.com>
+Date: Mon, 3 Aug 2026 17:19:43 +0100
+Subject: [PATCH 17/17] doc/decoders, Changelog, fate: document and test H.264
+ MVC
+
+The decoder section mirrors the one the hevc decoder has for MV-HEVC, and notes
+the two H.264 specific differences: the subset SPS that declares the views is
+usually carried in band rather than in extradata, so the view list may not exist
+when the decoder is opened, and there is no equivalent of the MV-HEVC 3D
+reference displays information SEI, so view positions are always unspecified.
+
+The three FATE tests cover output selection: the base view alone, the dependent
+view alone, and both together. All three decode the base view, since the
+dependent view predicts from it, so they differ only in what is emitted.
+
+They need h264/mvc-2view.264 in the FATE suite, 18628 bytes, which is not taken
+from any existing material: it was encoded here with JMVC 8.5 from two
+overlapping crops of one synthetic source, so the two views differ by a
+horizontal disparity and inter-view prediction is used throughout. Both views
+decode bit-identical to the reconstruction JMVC wrote while encoding them. The
+recipe and the encoder configuration are in mvc-work/sample/.
+
+(cherry picked from commit a1a9bee525c231a5100d52de19e17670faddbf3f)
+---
+ Changelog                         | 99 +++++++++++++++++++++++++++++++
+ doc/decoders.texi                 | 45 ++++++++++++++
+ tests/fate/h264.mak               |  9 +++
+ tests/ref/fate/h264-mvc-base      | 21 +++++++
+ tests/ref/fate/h264-mvc-both      | 42 +++++++++++++
+ tests/ref/fate/h264-mvc-dependent | 21 +++++++
+ 6 files changed, 237 insertions(+)
+ create mode 100644 tests/ref/fate/h264-mvc-base
+ create mode 100644 tests/ref/fate/h264-mvc-both
+ create mode 100644 tests/ref/fate/h264-mvc-dependent
+
+diff --git a/Changelog b/Changelog
+index b1dca93516..0d25f88abb 100644
+--- a/Changelog
++++ b/Changelog
+@@ -1,6 +1,105 @@
+ Entries are sorted chronologically from oldest to youngest within each release,
+ releases are sorted from youngest to oldest.
+ 
++version 9.0.1:
++ Bump for 9.0.1
++ avcodec/lcldec: clear what the multithread chunks leave undecoded
++ avformat/mlv: end the LJ92 packet where its data ends
++ avformat/mpegts: reject a max_packet_size below one TS payload
++ avformat/mpegts: keep the PES payload within max_packet_size
++ avfilter/spectrumsynth: negotiate one pixel format for both inputs
++ avfilter/afir: bound the crossfades by the samples of the input frame
++ Update for 9.0.1
++ avformat/webp_anim_dec: use ffio_read_size for ICCP and EXIF chunk
++ avformat/webp_anim_dec: use ffio_read_size for ICCP and EXIF chunks
++ avformat/rtpenc_av1: do not narrow the OBU size to (long)
++ avformat/rtpenc_av1: Check num_lebs
++ avformat/rtpenc_av1: bound OBU size in the keyframe search loop
++ avformat/gopher: Fix CRLF injection
++ avformat/rtpenc_vc2hq: reject data units larger than the RTP payload buffer
++ avformat/dashdec: reject a negative fragment index
++ avformat/hevc: reject hvcC NAL arrays that overflow the 16-bit count
++ avformat/mpegenc: reject stream counts that overflow the system header
++ avformat/mpegenc: pass buffer size into put_system_header()
++ avformat/librist: honor the caller buffer size in librist_read
++ avformat/scd: reject zero-channel tracks
++ avcodec/dolby_e: Add error recovery when parse_mantissas run out of bits
++ avfilter/af_pan: check the id of named input channels before use
++ swscale: avoid overflow in fast bilinear edge handling
++ avformat/shared: Use correct printf specifier
++ Revert "lavfi/bwdif: fix heap-buffer-overflow with small height videos"
++ avfilter/vf_bwdif: fix line boundary checks for >8 bits content
++ avformat/rawutils: reject raw RGB frames that do not fit an AVPacket
++ avcodec/nvenc: write AV1 timecode metadata in AV1 syntax
++ avcodec/utils: add ff_alloc_timecode_metadata_av1()
++ avcodec/utils: factor the timecode fields out of ff_alloc_timecode_sei
++ vulkan_encode_av1: set primary_ref_frame to a reference name, not a slot
++ avformat/mov: reject a trun sample count the input cannot hold
++ RELEASE_NOTES: Based on the version from 8.0
++ avformat/mp3enc: fix underflow of the LAME encoder delay
++ avformat/os_support: fix return value of win32_rename
++ vulkan_encode: fix leak and swallowed errors in init_base_units()
++ avfilter/dnn: fix async teardown race condition in all backends
++ avcodec/tiff: reject inflate output shorter than the strip
++ avformat/dashdec: check NULL pointer before use str_end_offset
++ avformat/dashdec: check NULL pointer of av_strtok value before use it
++ avfilter/vf_scale_cuda: fix non-scaling format conversion
++ fftools/opt_common: fix format string bug in print_program_info
++ avformat/dashdec: fix integer truncation in calc_max_seg_no()
++ swscale/x86: fix SIGILL in u8 SCALE on SSE4-only CPUs
++ avdevice/android_camera: fix OOB read in metadata parsing
++ avformat/dashdec: don't stop at the first input EOF
++ avformat/iamf_parse: check that num_sub_mixes and num_audio_elements in Mix Presentations are not zero
++ avformat/iamf_parse: bound the output mix gain duration by the audio elements
++ avcodec/cbs_h266: size vps_direct_ref_layer_flag for the full layer range
++ avcodec/vulkan/ffv1_dec_setup: act on the slice header rejection
++ avcodec/ffv1dec: reject a remap that produces zero entries
++ avcodec/ffv1dec: mark the slice damaged when its remap fails
++ avcodec/vulkan/ffv1_dec_setup: bound the fltmap write
++ avcodec/vulkan/ffv1_dec_setup: test mul_count as unsigned
++ avcodec/vulkan/ffv1_dec_setup: reject a remap that produces zero entries
++ avcodec/pgssubdec: always give an output rect a palette
++ scale_d3d11: Fix hw_frame_ctx reference leak
++ avcodec/cfhd: reject transform-2 output wider than the plane
++ avformat/rtsp: clear authentication on cross-origin redirects
++ avcodec/dovi_rpuenc: normalize vdr_dm_metadata_present to 0/1
++ avcodec/dovi_rpuenc: validate vdr_rpu_id from the input metadata
++ avcodec/bsf/dovi_rpu: handle update_rpu() returning no RPU
++ avcodec/dovi_rpudec: bound num_x/y_partitions
++ avcodec/dovi_rpuenc: validate the data mapping before generation
++ avfilter/af_arnndn: pad the DCT input buffers to the read length
++ doc/nut.texi: point at the latest spec in the git repository
++ avformat/mov: bound sgpd sync entry_count by the atom size
++ avcodec/rscc: do not leave uninitilized data when the input is too short
++ avcodec/dvbsub_parser: avoid signed overflow in the capacity check
++ avformat/tls_openssl: bind peer identity for numeric-IP verify
++ avformat/codec2: avoid integer overflow in packet size and duration
++ avfilter/vf_xpsnr: avoid a zero block size on small frames
++ avcodec/cbs_av1: pad the ITU-T T.35 payload buffer
++ avcodec/screenpresso: reject deflate output shorter than the frame
++ avformat/hls: Enforce protocol checks when opening child playlists
++ avformat/hlsenc: Fix heap buffer overflow in parse_playlist()
++ avformat/hlsenc: Handle extensionless URIs in extract_segment_number()
++ avfilter/vf_lut3d: do not compute size*size before the size is validated
++ avfilter/vf_hqdn3d: support dynamic frame sizes
++ avfilter/vf_hqdn3d: reject unsupported frame parameter changes
++ avcodec/bsf/truehd_core: clear profile value on init()
++ avcodec/bsf/eac3_core: clear profile value on init()
++ avformat/iamf_parse: fix inverted subblock duration validation
++ avcodec/get_buffer: use frame pixel format instead of context
++ avformat/lcevc: add a log context parameter to all functions
++version <next>:
++- H.264 MVC multiview decoding
++- extensively improved AAC encoder
++- APV Vulkan encoder
++- iTerm2 inline image protocol muxer
++- LCEVC payload merging bitstream filter
++- MVR demuxer
++- latticepal filter
++- DVD-Audio LPCM decoder and demuxing support
++- AVFoundation input device selection by unique ID and USB serial number
++
++
+ version 9.0:
+ - Extend AMF Color Converter (vf_vpp_amf) HDR capabilities
+ - LCEVC track muxing support in MP4 muxer
+diff --git a/doc/decoders.texi b/doc/decoders.texi
+index c8177c15e7..e392ae5f30 100644
+--- a/doc/decoders.texi
++++ b/doc/decoders.texi
+@@ -38,6 +38,51 @@ Select an operating point of a scalable AV1 bitstream (0 - 31). Default is 0.
+ 
+ @end table
+ 
++@section h264
++H.264 (AKA ITU-T H.264 or ISO/IEC 14496-10) decoder.
++
++The decoder supports MVC multiview streams (H.264 Annex H) with at most two
++views. Views to be output are selected by supplying a list of view IDs to the
++decoder (the @option{view_ids} option). This option may be set either statically
++before decoder init, or from the @code{get_format()} callback - useful because
++the subset SPS that declares the views is often carried in band rather than in
++extradata, so the views are not always known when the decoder is opened.
++
++Only the base view is decoded by default.
++
++Multiview decoding is not available with hardware acceleration; only the base
++view is decoded and a warning is logged. Frame and slice threading both work,
++as do field coded streams.
++
++Note that if you are using the @code{ffmpeg} CLI tool, you should be using view
++specifiers as documented in its manual, rather than the options documented here.
++
++@subsection Options
++
++@table @option
++
++@item view_ids (MVC)
++Specify a list of view IDs that should be output. This option can also be set to
++a single '-1', which will cause all views defined in the subset SPS to be
++decoded and output.
++
++@item view_ids_available (MVC)
++This option may be read by the caller to retrieve an array of view IDs available
++in the active subset SPS. The array is empty for single-view video.
++
++The value of this option is guaranteed to be accurate when read from the
++@code{get_format()} callback. It may also be set at other times (e.g. after
++opening the decoder), but the value is informational only.
++
++@item view_pos_available (MVC)
++This option may be read by the caller to retrieve an array of view positions
++(left, right, or unspecified) available in the active subset SPS, as
++@code{AVStereo3DView} values. H.264 has no equivalent of the MV-HEVC 3D
++reference displays information SEI message, so this array is left empty and
++positions are reported as unspecified.
++
++@end table
++
+ @section hevc
+ HEVC (AKA ITU-T H.265 or ISO/IEC 23008-2) decoder.
+ 
+diff --git a/tests/fate/h264.mak b/tests/fate/h264.mak
+index dacaaab274..0ae340444c 100644
+--- a/tests/fate/h264.mak
++++ b/tests/fate/h264.mak
+@@ -246,6 +246,8 @@ FATE_H264-$(call FRAMECRC, MXF, H264, PCM_S24LE_DECODER SCALE_FILTER ARESAMPLE_F
+ FATE_H264-$(call FRAMECRC, MOV, H264) += fate-h264-attachment-631
+ FATE_H264-$(call FRAMECRC, MPEGTS, H264, H264_PARSER MP3_DECODER SCALE_FILTER ARESAMPLE_FILTER) += fate-h264-skip-nokey
+ FATE_H264-$(call FRAMECRC, MPEGTS, H264, H264_PARSER MP3_DECODER SCALE_FILTER ARESAMPLE_FILTER EXTRACT_EXTRADATA_BSF) += fate-h264-skip-nointra
++FATE_H264-$(call FRAMECRC, H264, H264) += fate-h264-mvc-base fate-h264-mvc-both fate-h264-mvc-dependent
++
+ FATE_H264_FFPROBE-$(call DEMDEC, MATROSKA, H264) += fate-h264-dts_5frames
+ FATE_H264_FFPROBE-$(call PARSERDEMDEC, H264, H264, H264) += fate-h264-afd
+ 
+@@ -478,6 +480,13 @@ fate-h264-timecode:                               CMD = framecrc -i $(TARGET_SAM
+ 
+ fate-h264-reinit-%:                               CMD = framecrc -i $(TARGET_SAMPLES)/h264/$(@:fate-h264-%=%).h264 -vf scale,format=yuv444p10le,scale=w=352:h=288
+ 
++# MVC, two views. The dependent view predicts from the base view, so the base
++# view is decoded for all three of these; only the output selection differs.
++fate-h264-mvc-base:                               CMD = framecrc -i $(TARGET_SAMPLES)/h264/mvc-2view.264 -map "0:view:0"
++fate-h264-mvc-dependent:                          CMD = framecrc -i $(TARGET_SAMPLES)/h264/mvc-2view.264 -map "0:view:1"
++fate-h264-mvc-both:                               CMD = framecrc -i $(TARGET_SAMPLES)/h264/mvc-2view.264 \
++                                                        -map "0:view:0" -map "0:view:1" -vf setpts=N:strip_fps=1
++
+ fate-h264-dts_5frames:                            CMD = probeframes $(TARGET_SAMPLES)/h264/dts_5frames.mkv
+ fate-h264-afd:                                    CMD = run ffprobe$(PROGSSUF)$(EXESUF) -bitexact -apply_cropping 0 \
+                                                         -show_entries frame=width,height,crop_top,crop_bottom,crop_left,crop_right:frame_side_data_list:stream=width,height,coded_width,coded_height \
+diff --git a/tests/ref/fate/h264-mvc-base b/tests/ref/fate/h264-mvc-base
+new file mode 100644
+index 0000000000..d3968814af
+--- /dev/null
++++ b/tests/ref/fate/h264-mvc-base
+@@ -0,0 +1,21 @@
++#tb 0: 1/25
++#media_type 0: video
++#codec_id 0: rawvideo
++#dimensions 0: 320x192
++#sar 0: 0/1
++0,          0,          0,        1,    92160, 0xd3669efb
++0,          1,          1,        1,    92160, 0xfd7ed7ac
++0,          2,          2,        1,    92160, 0x454ef380
++0,          3,          3,        1,    92160, 0xd98220a1
++0,          4,          4,        1,    92160, 0xeda6382b
++0,          5,          5,        1,    92160, 0xd953743b
++0,          6,          6,        1,    92160, 0xed769167
++0,          7,          7,        1,    92160, 0xed9bcd0f
++0,          8,          8,        1,    92160, 0x262eb094
++0,          9,          9,        1,    92160, 0x8aacc0ca
++0,         10,         10,        1,    92160, 0x871ec9c2
++0,         11,         11,        1,    92160, 0x96ffc1b9
++0,         12,         12,        1,    92160, 0x2eb8b9e8
++0,         13,         13,        1,    92160, 0xd2e5b259
++0,         14,         14,        1,    92160, 0xfb91c020
++0,         15,         15,        1,    92160, 0xf06dcc1b
+diff --git a/tests/ref/fate/h264-mvc-both b/tests/ref/fate/h264-mvc-both
+new file mode 100644
+index 0000000000..c98b57b259
+--- /dev/null
++++ b/tests/ref/fate/h264-mvc-both
+@@ -0,0 +1,42 @@
++#tb 0: 1/1200000
++#media_type 0: video
++#codec_id 0: rawvideo
++#dimensions 0: 320x192
++#sar 0: 0/1
++#tb 1: 1/1200000
++#media_type 1: video
++#codec_id 1: rawvideo
++#dimensions 1: 320x192
++#sar 1: 0/1
++0,          0,          0,        0,    92160, 0xd3669efb
++1,          0,          0,        0,    92160, 0x23abfeff
++0,          1,          1,        0,    92160, 0xfd7ed7ac
++1,          1,          1,        0,    92160, 0xa40d2aa8
++0,          2,          2,        0,    92160, 0x454ef380
++1,          2,          2,        0,    92160, 0xb6964909
++0,          3,          3,        0,    92160, 0xd98220a1
++1,          3,          3,        0,    92160, 0x3c21784f
++0,          4,          4,        0,    92160, 0xeda6382b
++1,          4,          4,        0,    92160, 0x8d2b89bd
++0,          5,          5,        0,    92160, 0xd953743b
++1,          5,          5,        0,    92160, 0xa708be58
++0,          6,          6,        0,    92160, 0xed769167
++1,          6,          6,        0,    92160, 0xc139d29f
++0,          7,          7,        0,    92160, 0xed9bcd0f
++1,          7,          7,        0,    92160, 0x5253fe64
++0,          8,          8,        0,    92160, 0x262eb094
++1,          8,          8,        0,    92160, 0xfc10d772
++0,          9,          9,        0,    92160, 0x8aacc0ca
++1,          9,          9,        0,    92160, 0x8e32dc43
++0,         10,         10,        0,    92160, 0x871ec9c2
++1,         10,         10,        0,    92160, 0xf837e13b
++0,         11,         11,        0,    92160, 0x96ffc1b9
++1,         11,         11,        0,    92160, 0xd453cf74
++0,         12,         12,        0,    92160, 0x2eb8b9e8
++1,         12,         12,        0,    92160, 0xcbcac2eb
++0,         13,         13,        0,    92160, 0xd2e5b259
++1,         13,         13,        0,    92160, 0x61c2be04
++0,         14,         14,        0,    92160, 0xfb91c020
++1,         14,         14,        0,    92160, 0xadf4c037
++0,         15,         15,        0,    92160, 0xf06dcc1b
++1,         15,         15,        0,    92160, 0x7ccec9f8
+diff --git a/tests/ref/fate/h264-mvc-dependent b/tests/ref/fate/h264-mvc-dependent
+new file mode 100644
+index 0000000000..eb6b62cb73
+--- /dev/null
++++ b/tests/ref/fate/h264-mvc-dependent
+@@ -0,0 +1,21 @@
++#tb 0: 1/25
++#media_type 0: video
++#codec_id 0: rawvideo
++#dimensions 0: 320x192
++#sar 0: 0/1
++0,          0,          0,        1,    92160, 0x23abfeff
++0,          1,          1,        1,    92160, 0xa40d2aa8
++0,          2,          2,        1,    92160, 0xb6964909
++0,          3,          3,        1,    92160, 0x3c21784f
++0,          4,          4,        1,    92160, 0x8d2b89bd
++0,          5,          5,        1,    92160, 0xa708be58
++0,          6,          6,        1,    92160, 0xc139d29f
++0,          7,          7,        1,    92160, 0x5253fe64
++0,          8,          8,        1,    92160, 0xfc10d772
++0,          9,          9,        1,    92160, 0x8e32dc43
++0,         10,         10,        1,    92160, 0xf837e13b
++0,         11,         11,        1,    92160, 0xd453cf74
++0,         12,         12,        1,    92160, 0xcbcac2eb
++0,         13,         13,        1,    92160, 0x61c2be04
++0,         14,         14,        1,    92160, 0xadf4c037
++0,         15,         15,        1,    92160, 0x7ccec9f8
+-- 
+2.55.0
+

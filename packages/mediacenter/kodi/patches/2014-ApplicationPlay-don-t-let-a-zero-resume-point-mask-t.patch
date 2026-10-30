@@ -1,0 +1,59 @@
+From 06968b889f2b81bc81eb16121803fb0ed7c78f8f Mon Sep 17 00:00:00 2001
+From: Dom Cobley <popcornmix@gmail.com>
+Date: Sun, 9 Aug 2026 13:00:29 +0100
+Subject: [PATCH 2014/2064] ApplicationPlay: don't let a zero resume point mask
+ the one in the database
+
+GetOptionsAndUpdateItem() used CFileItem::IsResumePointSet() to decide whether
+the item already carried a resume position, and only consulted
+CVideoDatabase::GetResumeBookMark() when it did not. That test is
+CBookmark::IsSet(), which checks totalTimeInSeconds alone, so a resume point
+holding a position of zero alongside a known duration counts as set.
+
+Add-ons produce exactly that shape. plugin.video.youtube calls
+InfoTagVideo.setResumePoint(0, duration) on the item it returns from
+setResolvedUrl whenever its own playback history holds no position for the
+video, and CVideoInfoTag::Merge() copies it over the item's real resume point
+while CPluginDirectory resolves the plugin path, as that gates on IsSet() too.
+The zero then satisfied the check here, so starttime was taken as zero and the
+resume bookmark in the database - correct all along - was never read. Playback
+restarted from the beginning, and because the two stores are written
+independently the video kept restarting from the beginning on every attempt.
+
+Require an actual position instead. GetCurrentResumeTime() is already called on
+the following line, so this keeps one notion of a usable resume position, and a
+zero now falls through to the database lookup as intended. The existing
+starttime == 0.0 guard below still clears the stale resume request when no
+source has a position to offer.
+
+(cherry picked from commit e4948a72f82213ff4465edd85ad26b6394d2c81c)
+---
+ xbmc/application/ApplicationPlay.cpp | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/xbmc/application/ApplicationPlay.cpp b/xbmc/application/ApplicationPlay.cpp
+index 3ffbab621d..818e5037d1 100644
+--- a/xbmc/application/ApplicationPlay.cpp
++++ b/xbmc/application/ApplicationPlay.cpp
+@@ -141,8 +141,16 @@ void CApplicationPlay::GetOptionsAndUpdateItem()
+     {
+       m_options.starttime = 0.0;
+ 
+-      // See if resume point is set in the item
+-      if (m_item.IsResumePointSet())
++      // See if a usable resume point is set in the item.
++      // Deliberately not CFileItem::IsResumePointSet(): CBookmark::IsSet() only
++      // tests totalTimeInSeconds, so a resume point carrying a position of zero
++      // alongside a known duration counts as "set". Add-ons produce exactly that
++      // when they stamp InfoTagVideo.setResumePoint(0, duration) on the item they
++      // return from setResolvedUrl, and CVideoInfoTag::Merge() then copies it over
++      // the item's real resume point during plugin path resolution. Trusting it
++      // here would mask the resume position held in the database and restart
++      // playback from the beginning, so require an actual position instead.
++      if (m_item.GetCurrentResumeTime() > 0.0)
+       {
+         m_options.starttime = m_item.GetCurrentResumeTime();
+         if (m_item.HasVideoInfoTag())
+-- 
+2.56.0
+

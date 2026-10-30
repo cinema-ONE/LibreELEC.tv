@@ -1,0 +1,166 @@
+From a427f3a6b7ffb29c2baa9e27e85b22dd98a97452 Mon Sep 17 00:00:00 2001
+From: Dom Cobley <popcornmix@gmail.com>
+Date: Sat, 19 Sep 2026 21:28:22 +0100
+Subject: [PATCH 2049/2064] VideoPlayer: resume a disc where it was left
+
+Play part of a disc image, stop, and play it again: it starts from the
+beginning. The position was kept, and playing the playlist itself resumes
+correctly, but nothing found it from the disc.
+
+A disc is watched a playlist at a time, so the resume point is stored against
+the playlist that was playing -- bluray://<disc>/BDMV/PLAYLIST/00800.mpls -- and
+that is not what the viewer picks. Looking the image up finds nothing, and a
+disc that has never been played is started from its beginning.
+
+Look for it where it is. A disc offers the resume point of the most recently
+played of its playlists, so it shows as part watched and is offered as a resume,
+and resuming plays that playlist rather than the disc. The playlist has to be
+played rather than the disc because a resume is not a start, so none of the
+searches that pick a playlist run.
+
+(cherry picked from commit 9d43e9166ee24228cda893e05a7444c2a04e1ea8)
+---
+ xbmc/application/ApplicationPlay.cpp | 13 ++++++
+ xbmc/video/VideoDatabase.cpp         | 66 ++++++++++++++++++++++++++++
+ xbmc/video/VideoDatabase.h           | 12 +++++
+ 3 files changed, 91 insertions(+)
+
+diff --git a/xbmc/application/ApplicationPlay.cpp b/xbmc/application/ApplicationPlay.cpp
+index e7adcf22b5..cf72b0b6c6 100644
+--- a/xbmc/application/ApplicationPlay.cpp
++++ b/xbmc/application/ApplicationPlay.cpp
+@@ -160,11 +160,24 @@ void CApplicationPlay::GetOptionsAndUpdateItem()
+       {
+         // See if there is resume point in the database
+         CBookmark bookmark;
++        std::string playlistPath;
+         if (db.GetResumeBookMark(path, bookmark))
+         {
+           m_options.starttime = bookmark.timeInSeconds;
+           m_options.state = bookmark.playerState;
+         }
++        else if (::UTILS::DISCS::IsBlurayDiscImage(m_item) &&
++                 db.GetDiscResumeBookMark(path, bookmark, playlistPath))
++        {
++          // A disc's resume point belongs to the playlist that was playing rather than to the
++          // disc, so resume that playlist. The point goes on the item as well as into the
++          // options: CDVDInputStreamBluray reads the playlist to resume out of the state the
++          // item carries.
++          m_options.starttime = bookmark.timeInSeconds;
++          m_options.state = bookmark.playerState;
++          m_item.GetVideoInfoTag()->SetResumePoint(bookmark);
++          m_item.SetDynPath(playlistPath);
++        }
+         else if (m_options.starttime == 0.0)
+           GetEpisodeBookmark(m_item, m_options, db);
+       }
+diff --git a/xbmc/video/VideoDatabase.cpp b/xbmc/video/VideoDatabase.cpp
+index 5abf7e8b1d..651099cfbc 100644
+--- a/xbmc/video/VideoDatabase.cpp
++++ b/xbmc/video/VideoDatabase.cpp
+@@ -3627,6 +3627,57 @@ bool CVideoDatabase::GetResumeBookMark(const std::string& strFilenameAndPath, CB
+   return false;
+ }
+ 
++bool CVideoDatabase::GetDiscResumeBookMark(const std::string& discPath,
++                                           CBookmark& bookmark,
++                                           std::string& playlistPath)
++{
++  // A disc is watched a playlist at a time, and the resume point is kept against the playlist
++  // that was playing, not against the image or folder the viewer picked. Look for it where it
++  // is, so that the disc itself can offer it.
++  const std::string playlistFolder{URIUtils::GetBlurayPlaylistPath(discPath)};
++  if (playlistFolder.empty())
++    return false;
++
++  try
++  {
++    if (!m_pDB || !m_pDS2)
++      return false;
++
++    // The most recently played playlist of the disc that has one, a disc having as many as the
++    // viewer has started.
++    const std::string sql{PrepareSQL("SELECT files.strFilename, bookmark.timeInSeconds, "
++                                     "bookmark.totalTimeInSeconds, bookmark.playerState FROM files "
++                                     "JOIN path ON path.idPath = files.idPath "
++                                     "JOIN bookmark ON bookmark.idFile = files.idFile "
++                                     "AND bookmark.type = %i "
++                                     "WHERE path.strPath = '%s' "
++                                     "ORDER BY files.lastPlayed DESC",
++                                     static_cast<int>(CBookmark::RESUME), playlistFolder.c_str())};
++
++    m_pDS2->query(sql);
++    if (m_pDS2->eof())
++    {
++      m_pDS2->close();
++      return false;
++    }
++
++    playlistPath = playlistFolder + m_pDS2->fv(0).get_asString();
++    bookmark.timeInSeconds = m_pDS2->fv(1).get_asDouble();
++    bookmark.totalTimeInSeconds = m_pDS2->fv(2).get_asDouble();
++    // Says which playlist to resume, which is how CDVDInputStreamBluray finds it.
++    bookmark.playerState = m_pDS2->fv(3).get_asString();
++    bookmark.type = CBookmark::RESUME;
++    m_pDS2->close();
++
++    return true;
++  }
++  catch (...)
++  {
++    CLog::LogF(LOGERROR, "({}) failed", CURL::GetRedacted(discPath));
++  }
++  return false;
++}
++
+ void CVideoDatabase::DeleteResumeBookMark(const CFileItem& item)
+ {
+   if (!m_pDB || !m_pDS)
+@@ -6547,6 +6598,21 @@ bool CVideoDatabase::GetPlayCounts(const std::string &strPath, CFileItemList &it
+         }
+         m_pDS->next();
+       }
++      m_pDS->close();
++
++      // A disc keeps its resume point against the playlist that was playing, which lives under
++      // the disc rather than beside it, so the query above cannot have found it.
++      for (const auto& item : items)
++      {
++        if (!item || item->IsFolder() || item->GetVideoInfoTag()->GetResumePoint().IsSet() ||
++            !URIUtils::IsDiscImage(item->GetDynPath()))
++          continue;
++
++        CBookmark bookmark;
++        std::string playlistPath;
++        if (GetDiscResumeBookMark(item->GetDynPath(), bookmark, playlistPath))
++          item->GetVideoInfoTag()->SetResumePoint(bookmark);
++      }
+     }
+ 
+     return found || hasPlugin;
+diff --git a/xbmc/video/VideoDatabase.h b/xbmc/video/VideoDatabase.h
+index ed3777e4b8..1f2fc4e41e 100644
+--- a/xbmc/video/VideoDatabase.h
++++ b/xbmc/video/VideoDatabase.h
+@@ -528,6 +528,18 @@ public:
+                          const CBookmark& bookmark,
+                          CBookmark::EType type = CBookmark::STANDARD);
+   bool GetResumeBookMark(const std::string& strFilenameAndPath, CBookmark &bookmark);
++
++  /*!
++   \brief Get the resume point stored for a disc, which belongs to one of its playlists
++          rather than to the disc itself.
++   \param discPath path of the disc image or BDMV folder
++   \param bookmark filled with the resume point found
++   \param playlistPath filled with the bluray:// path of the playlist it belongs to
++   \return true if the disc has a resume point
++   */
++  bool GetDiscResumeBookMark(const std::string& discPath,
++                             CBookmark& bookmark,
++                             std::string& playlistPath);
+   void DeleteResumeBookMark(const CFileItem& item);
+   void ClearBookMarkOfFile(const std::string& strFilenameAndPath,
+                            const CBookmark& bookmark,
+-- 
+2.56.0
+

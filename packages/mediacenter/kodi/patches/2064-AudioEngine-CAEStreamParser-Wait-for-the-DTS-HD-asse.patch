@@ -1,0 +1,39 @@
+From 6d65253a251822264eeb362b5053e819f354d809 Mon Sep 17 00:00:00 2001
+From: cinemaONE <35371193+cinema-ONE@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 12:48:36 +0100
+Subject: [PATCH 2064/2064] [AudioEngine][CAEStreamParser] Wait for the DTS-HD
+ asset sync before classifying
+
+Only ten bytes past the core were known to be buffered, while the asset
+syncword sits header_size bytes into the extension. An extension header
+split across two packets was then classified from stale buffer bytes,
+and with the previous commit such a frame was dropped instead of typed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ xbmc/cores/AudioEngine/Utils/AEStreamInfo.cpp | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/xbmc/cores/AudioEngine/Utils/AEStreamInfo.cpp b/xbmc/cores/AudioEngine/Utils/AEStreamInfo.cpp
+index e065f00a51..e7dfc4d13b 100644
+--- a/xbmc/cores/AudioEngine/Utils/AEStreamInfo.cpp
++++ b/xbmc/cores/AudioEngine/Utils/AEStreamInfo.cpp
+@@ -639,6 +639,15 @@ unsigned int CAEStreamParser::SyncDTS(uint8_t* data, unsigned int size)
+       else
+         header_size = (((data[m_fsize + 5] & 0x1f) << 3) | ((data[m_fsize + 6] & 0xe0) >> 5)) + 1;
+ 
++      if (size - skip < m_fsize + header_size + 4)
++      {
++        m_syncFunc = &CAEStreamParser::SyncDTS;
++        m_needBytes = m_fsize + header_size + 4;
++        m_fsize = 0;
++
++        return skip;
++      }
++
+       hd_sync = data[m_fsize + header_size] << 24 | data[m_fsize + header_size + 1] << 16 |
+                 data[m_fsize + header_size + 2] << 8 | data[m_fsize + header_size + 3];
+ 
+-- 
+2.56.0
+

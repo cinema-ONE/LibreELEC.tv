@@ -1,0 +1,202 @@
+From: cinemaONE <35371193+cinema-ONE@users.noreply.github.com>
+Subject: [PATCH] drm/amd/display: Dolby Vision Low-Latency over FRL at 4320p, with DSC
+
+A test: let the Low-Latency tunnel (0127) use an FRL link, the CTA
+4320p modes at 24 to 60 Hz and DSC, which DC selects where the mode
+does not fit the link (4320p60 RGB 8 bpc). DSC is lossy, so the
+tunnelled bytes are not kept exactly. VICs above 127 need AVI version 3.
+The Standard tunnel is unchanged. Our own code, MIT.
+---
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index 42596e8..262becd 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -3849,18 +3849,23 @@ bool amdgpu_dm_dvbridge_stream_active(const struct dc_stream_state *stream)
+ 	       stream->vsp_infopacket.sb[3] == 0x00;
+ }
+ 
++bool amdgpu_dm_dvbridge_stream_low_latency(const struct dc_stream_state *stream)
++{
++	return amdgpu_dm_dvbridge_stream_active(stream) && (stream->vsp_infopacket.sb[4] & BIT(0));
++}
++
+ static int amdgpu_dm_dvbridge_fill_stream(struct drm_connector *connector,
+ 					  const struct drm_display_mode *mode,
+ 					  const struct drm_connector_state *con_state,
+ 					  struct dc_stream_state *stream)
+ {
+ 	u8 buf[HDMI_INFOFRAME_SIZE(DOLBY_VENDOR)];
+-	u8 vic = amdgpu_dm_dvbridge_avi_vic(drm_match_cea_mode(mode));
+ 	/* Hades: Dolby Vision Low-Latency over the tunnel (drm_dvbridge_ll.h) */
+ 	const bool low_latency = to_dm_connector_state(con_state)->dvbridge_dv_low_latency;
++	u8 vic = amdgpu_dm_dvbridge_vic(drm_match_cea_mode(mode), low_latency);
+ 	struct hdmi_dolby_vendor_infoframe dv;
+ 	struct hdmi_avi_infoframe avi;
+-	ssize_t len;
++	ssize_t len, i;
+ 	bool p60;
+ 	int ret;
+ 
+@@ -3901,6 +3906,14 @@ static int amdgpu_dm_dvbridge_fill_stream(struct drm_connector *connector,
+ 	len = hdmi_avi_infoframe_pack(&avi, buf, sizeof(buf));
+ 	if (len < 0)
+ 		return len;
++	/* hdmi_avi_infoframe_pack() writes version 2 and a 7-bit VIC */
++	if (vic > 127) {
++		buf[1] = 3;
++		buf[7] = vic;
++		buf[3] = 0;
++		for (i = 0; i < len; i++)
++			buf[3] -= buf[i];
++	}
+ 	ret = amdgpu_dm_dvbridge_infopacket(buf, len, &stream->avi_infopacket);
+ 	if (ret)
+ 		return ret;
+@@ -3942,9 +3955,11 @@ int amdgpu_dm_dvbridge_check_connector(struct amdgpu_dm_connector *aconn,
+ 	if (!crtc_state->active)
+ 		return 0; /* nothing is sent; enabling the CRTC again is a modeset */
+ 
+-	/* Native TMDS HDMI (the sink's Dolby Vision support is checked on the stream). */
++	/* Native TMDS HDMI, for Low-Latency also FRL (the sink's DV support is checked on the stream). */
+ 	if (aconn->base.connector_type != DRM_MODE_CONNECTOR_HDMIA || !aconn->dc_link ||
+-	    aconn->dc_link->connector_signal != SIGNAL_TYPE_HDMI_TYPE_A ||
++	    !(aconn->dc_link->connector_signal == SIGNAL_TYPE_HDMI_TYPE_A ||
++	      (dm_state->dvbridge_dv_low_latency &&
++	       aconn->dc_link->connector_signal == SIGNAL_TYPE_HDMI_FRL)) ||
+ 	    !aconn->base.display_info.has_hdmi_infoframe)
+ 		return -EOPNOTSUPP;
+ 	if (con_state->max_requested_bpc != 8 ||
+@@ -3958,7 +3973,7 @@ int amdgpu_dm_dvbridge_check_connector(struct amdgpu_dm_connector *aconn,
+ 	     (dm_state->underscan_hborder || dm_state->underscan_vborder)))
+ 		return -EINVAL;
+ 	mode = &crtc_state->mode;
+-	if (!amdgpu_dm_dvbridge_avi_vic(drm_match_cea_mode(mode)) ||
++	if (!amdgpu_dm_dvbridge_vic(drm_match_cea_mode(mode), dm_state->dvbridge_dv_low_latency) ||
+ 	    (mode->flags & (DRM_MODE_FLAG_INTERLACE | DRM_MODE_FLAG_DBLSCAN |
+ 			    DRM_MODE_FLAG_DBLCLK | DRM_MODE_FLAG_3D_MASK)))
+ 		return -EINVAL;
+@@ -3986,11 +4001,14 @@ static int amdgpu_dm_dvbridge_check_scanout(struct drm_atomic_commit *state,
+ 	w = stream->timing.h_addressable;
+ 	h = stream->timing.v_addressable;
+ 
+-	/* RGB 8 bpc full range over TMDS, truncated, without output colour processing. */
+-	if (stream->signal != SIGNAL_TYPE_HDMI_TYPE_A ||
++	/* RGB 8 bpc full range over TMDS (or FRL for Low-Latency), truncated, no output colour processing. */
++	if (!(stream->signal == SIGNAL_TYPE_HDMI_TYPE_A ||
++	      (amdgpu_dm_dvbridge_stream_low_latency(stream) &&
++	       stream->signal == SIGNAL_TYPE_HDMI_FRL)) ||
+ 	    stream->timing.pixel_encoding != PIXEL_ENCODING_RGB ||
+ 	    stream->timing.display_color_depth != COLOR_DEPTH_888 ||
+-	    stream->timing.flags.INTERLACE || stream->timing.flags.DSC ||
++	    stream->timing.flags.INTERLACE ||
++	    (stream->timing.flags.DSC && !amdgpu_dm_dvbridge_stream_low_latency(stream)) ||
+ 	    stream->timing.timing_3d_format != TIMING_3D_FORMAT_NONE ||
+ 	    stream->timing.h_border_left || stream->timing.h_border_right ||
+ 	    stream->timing.v_border_top || stream->timing.v_border_bottom ||
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_dvbridge.h b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_dvbridge.h
+index 4e290bb..92b0485 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_dvbridge.h
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_dvbridge.h
+@@ -13,19 +13,22 @@
+ #include <linux/types.h>
+ 
+ struct dc_stream_state;
+-
+-/* The stream carries the Dolby Vision tunnel (its vendor slot holds the Dolby VSIF). */
+-extern bool amdgpu_dm_dvbridge;
+-bool amdgpu_dm_dvbridge_stream_active(const struct dc_stream_state *stream);
+ struct amdgpu_dm_connector;
+ struct drm_connector_state;
+ struct drm_atomic_commit;
+ struct amdgpu_device;
++
++/* amdgpu_dm.c defines these; amdgpu_dm_connector.c attaches and checks the property. */
++extern bool amdgpu_dm_dvbridge;
+ int amdgpu_dm_dvbridge_check_connector(struct amdgpu_dm_connector *aconn,
+-					      const struct drm_connector_state *con_state,
+-					      struct drm_atomic_commit *state);
++				       const struct drm_connector_state *con_state,
++				       struct drm_atomic_commit *state);
+ bool amdgpu_dm_dvbridge_dcn_reviewed(const struct amdgpu_device *adev);
+ 
++/* The stream carries the Dolby Vision tunnel (its vendor slot holds the Dolby VSIF). */
++bool amdgpu_dm_dvbridge_stream_active(const struct dc_stream_state *stream);
++bool amdgpu_dm_dvbridge_stream_low_latency(const struct dc_stream_state *stream);
++
+ /*
+  * An EDID with exactly one Dolby VSVDB that advertises Standard (TV-led) DV with the Dolby VSIF:
+  * version 2 with interface 2 or 3, or version 1 in its 12-byte form with the low-latency field 1
+@@ -110,4 +113,12 @@ static inline u8 amdgpu_dm_dvbridge_avi_vic(u8 cea_vic)
+ 	}
+ }
+ 
++/* Low-Latency also takes CTA 4320p at 24 to 60 Hz, over FRL and with DSC (AVI version 3). */
++static inline u8 amdgpu_dm_dvbridge_vic(u8 cea_vic, bool low_latency)
++{
++	if (low_latency && cea_vic >= 194 && cea_vic <= 199)
++		return cea_vic;
++	return amdgpu_dm_dvbridge_avi_vic(cea_vic);
++}
++
+ #endif
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_dvbridge_refused.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_dvbridge_refused.c
+index fb0e250..ad8a9f9 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_dvbridge_refused.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_dvbridge_refused.c
+@@ -142,9 +142,11 @@ static u64 dvbridge_why_connector(const struct amdgpu_dm_connector *aconn,
+ 		len += scnprintf(buf + len, size - len, "%snot a native HDMI connector",
+ 				 len ? "; " : "");
+ 	} else if (link->connector_signal == SIGNAL_TYPE_HDMI_FRL) {
+-		bits |= REFUSED(FRL);
+-		len += scnprintf(buf + len, size - len,
+-				 "%sthe HDMI connector is driven in FRL", len ? "; " : "");
++		if (!dm_state->dvbridge_dv_low_latency) {
++			bits |= REFUSED(FRL);
++			len += scnprintf(buf + len, size - len,
++					 "%sthe HDMI connector is driven in FRL", len ? "; " : "");
++		}
+ 	} else if (link->connector_signal != SIGNAL_TYPE_HDMI_TYPE_A) {
+ 		bits |= REFUSED(CONVERTER);
+ 		len += scnprintf(buf + len, size - len, "%sconnector signal %#x",
+@@ -177,7 +179,8 @@ static u64 dvbridge_why_connector(const struct amdgpu_dm_connector *aconn,
+ 				 dm_state->underscan_enable ? dm_state->underscan_hborder : 0,
+ 				 dm_state->underscan_enable ? dm_state->underscan_vborder : 0);
+ 	}
+-	if (mode && (!amdgpu_dm_dvbridge_avi_vic(drm_match_cea_mode(mode)) ||
++	if (mode && (!amdgpu_dm_dvbridge_vic(drm_match_cea_mode(mode),
++					     dm_state->dvbridge_dv_low_latency) ||
+ 		     (mode->flags & (DRM_MODE_FLAG_INTERLACE | DRM_MODE_FLAG_DBLSCAN |
+ 				     DRM_MODE_FLAG_DBLCLK | DRM_MODE_FLAG_3D_MASK)))) {
+ 		bits |= REFUSED(MODE);
+@@ -212,7 +215,7 @@ void amdgpu_dm_dvbridge_refused_stream(struct drm_connector *connector,
+ 				       const struct dc_stream_state *stream, bool low_latency)
+ {
+ 	struct amdgpu_dm_connector *aconn = to_amdgpu_dm_connector(connector);
+-	u8 vic = amdgpu_dm_dvbridge_avi_vic(drm_match_cea_mode(mode));
++	u8 vic = amdgpu_dm_dvbridge_vic(drm_match_cea_mode(mode), low_latency);
+ 	char detail[320];
+ 	size_t len = 0;
+ 	u64 bits = 0;
+@@ -272,8 +275,10 @@ static u64 dvbridge_why_scanout(struct drm_atomic_commit *state, struct drm_crtc
+ 
+ 	buf[0] = '\0';
+ 	if (stream->signal == SIGNAL_TYPE_HDMI_FRL) {
+-		bits |= REFUSED(FRL);
+-		len += scnprintf(buf + len, size - len, "the stream is HDMI FRL");
++		if (!amdgpu_dm_dvbridge_stream_low_latency(stream)) {
++			bits |= REFUSED(FRL);
++			len += scnprintf(buf + len, size - len, "the stream is HDMI FRL");
++		}
+ 	} else if (stream->signal == SIGNAL_TYPE_DVI_SINGLE_LINK ||
+ 		   stream->signal == SIGNAL_TYPE_DVI_DUAL_LINK) {
+ 		bits |= REFUSED(SINK);
+@@ -324,7 +329,8 @@ static u64 dvbridge_why_scanout(struct drm_atomic_commit *state, struct drm_crtc
+ 	vrr = crtc_state->vrr_enabled ||
+ 	      dm_crtc_state->freesync_config.state == VRR_STATE_ACTIVE_VARIABLE ||
+ 	      dm_crtc_state->freesync_config.state == VRR_STATE_ACTIVE_FIXED;
+-	if (stream->timing.flags.DSC || stream->dither_option != DITHER_OPTION_TRUN8 ||
++	if ((stream->timing.flags.DSC && !amdgpu_dm_dvbridge_stream_low_latency(stream)) ||
++	    stream->dither_option != DITHER_OPTION_TRUN8 ||
+ 	    stream->gamut_remap_matrix.enable_remap ||
+ 	    stream->csc_color_matrix.enable_adjustment || luts ||
+ 	    dm_crtc_state->regamma_tf != AMDGPU_TRANSFER_FUNCTION_DEFAULT || vrr) {

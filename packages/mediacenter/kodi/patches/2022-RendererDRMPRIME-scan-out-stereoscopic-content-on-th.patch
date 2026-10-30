@@ -1,0 +1,687 @@
+From 704acfd94730bfec3d2d468f88d434613bdfec65 Mon Sep 17 00:00:00 2001
+From: Dom Cobley <popcornmix@gmail.com>
+Date: Mon, 27 Jul 2026 18:59:10 +0100
+Subject: [PATCH 2022/2064] RendererDRMPRIME: scan out stereoscopic content on
+ the video planes
+
+The direct-to-plane renderer had no stereoscopic handling at all. Two symptoms:
+
+- In a split stereo mode GetResInfo() halves iWidth/iHeight and scales
+  fPixelRatio, which sent ManageRenderArea() down the iScreenWidth != iWidth
+  branch and aspect-fitted the frame with the scaled ratio, shrinking the plane
+  to the middle of the screen with black bars.
+
+- "Watch as 2D" (RenderStereoMode::MONO) showed both eyes side by side. The GL
+  renderers get this right by honouring m_sourceRect, which
+  CBaseRenderer::ManageRenderArea() crops to the eye selected by the current
+  RenderStereoView; the plane hardcoded its source to the whole buffer.
+
+Pass a source rectangle down to the bridge and program SRC_X/Y/W/H from it.
+Buffer dimensions equal the picture dimensions, so m_sourceRect maps directly.
+Those properties are 16.16 fixed point, so keep the fractional part rather than
+truncating to whole pixels: that precision is what lets a plane pan and zoom
+smoothly, and any alignment the hardware needs is the driver's to apply, since
+userspace cannot enumerate it. This alone fixes MONO, and the OFF case is
+unchanged because m_sourceRect is then the whole frame.
+
+Handle a split stereo mode in a separate SetStereoPlaneGeometry(), called ahead
+of the existing geometry code, which is otherwise untouched. DRM can drive
+several planes from one framebuffer, so claim a second video plane and give each
+eye its own. The geometry then comes entirely from the shared code the GL
+renderers already use:
+
+  CBaseRenderer::ManageRenderArea() crops m_sourceRect to the eye of the
+  current RenderStereoView and fits it to the halved screen that GetResInfo()
+  reports for a split mode; CGraphicContext::StereoCorrection() then offsets
+  that half to where the sink expects it - iHeight + iBlanking, i.e. below the
+  active space gap for frame packing.
+
+Running it once per view therefore yields both plane rectangles, and because the
+source crop and the output placement are independent, side-by-side to
+top-and-bottom conversion falls out for free - including to frame packing, whose
+active space gap no single uniform mapping can reproduce. Zoom, vertical shift,
+view mode, overscan calibration and the right_left cadence swap all behave as
+they do on the GL renderers, and each eye is aspect-fitted within its own half.
+Those rectangles are in GUI coordinates, so scale them to the scanout: the two
+differ when the GUI is rendered smaller than the display mode (limitguisize),
+where the eyes would otherwise cover only the GUI-sized corner of the screen.
+
+CRendererMediaCodecSurface::RenderUpdate() already forces a stereo view around
+ManageRenderArea() for the same reason; the difference here is restoring the
+previous view afterwards rather than forcing OFF.
+
+The second plane is optional. It is only searched for when the source is
+stereoscopic, so ordinary playback claims exactly the planes it does today. If
+none is free, fall back to scanning the whole packed frame across the whole
+screen with one plane: a 3D display consumes the packed frame directly and a 2D
+display shows the expected side-by-side / over-under layout, as
+CRendererMediaCodecSurface does for the equivalent un-splittable surface. That
+fallback applies one source->dest mapping, so the per-eye aspect can be corrected
+only on the axis both eyes share - vertically for side-by-side, horizontally for
+top-and-bottom, narrowing the other would move the eye boundary away from the
+screen half the display expects - and frame packing is not usable with it, a
+1920x2160 top-and-bottom source stretched over the 2205-line scanout putting the
+eye boundary at 1102 instead of 1125.
+
+A plane reassignment drops a claimed plane, so reclaim the pair on demand from
+the buffer properties cached at Configure, abandoning the search for good on the
+first failure. FindGuiPlane()'s "reuse the existing gui plane" fast path ends in
+m_video_plane = nullptr, which is right for the single-plane model where one
+plane flips between the gui and video roles, but direct-to-plane holds both at
+once: without this a mid-playback display mode change left the video black with a
+working OSD. The window is not specific to 3D, but 3D makes it reliable, because
+the GUI stereo mode is applied a frame after the renderer is configured and the
+display mode is therefore only chosen once the renderer already owns its planes.
+
+Composition cost is essentially unchanged: two planes each scanning out half of
+the packed frame move the same source and destination pixels as one plane
+scanning out all of it. Only the fixed per-plane overhead is added.
+
+(cherry picked from commit 246cff4ecf6a693beb0bbac56668d08972c53fda)
+---
+ .../HwDecRender/RendererDRMPRIME.cpp          | 164 +++++++++++++++++-
+ .../HwDecRender/RendererDRMPRIME.h            |  28 +++
+ .../HwDecRender/VideoLayerBridgeDRMPRIME.cpp  | 117 ++++++++++---
+ .../HwDecRender/VideoLayerBridgeDRMPRIME.h    |  22 ++-
+ xbmc/windowing/gbm/drm/DRMAtomic.cpp          |   2 +
+ xbmc/windowing/gbm/drm/DRMUtils.cpp           |  48 +++++
+ xbmc/windowing/gbm/drm/DRMUtils.h             |  11 ++
+ 7 files changed, 364 insertions(+), 28 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp
+index 40556ef057..f665bdc355 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp
+@@ -24,6 +24,10 @@
+ #include "windowing/gbm/WinSystemGbm.h"
+ #include "windowing/gbm/drm/DRMAtomic.h"
+ 
++#include <algorithm>
++#include <array>
++#include <span>
++
+ using namespace KODI::WINDOWING::GBM;
+ 
+ CRendererDRMPRIME::~CRendererDRMPRIME()
+@@ -134,6 +138,10 @@ bool CRendererDRMPRIME::Configure(const VideoPicture& picture, float fps, unsign
+                             "GUI compositing not supported by windowing system");
+   }
+ 
++  // A stereoscopic source needs one plane per eye; without a second plane the
++  // whole packed frame is scanned out on the single plane instead.
++  m_stereoPlaneWanted = CachePlaneParams(picture) && CONF_FLAGS_STEREO_MODE_MASK(m_iFlags) != 0;
++
+   // Calculate the input frame aspect ratio.
+   CalculateFrameAspectRatio(picture.iDisplayWidth, picture.iDisplayHeight);
+   SetViewMode(m_videoSettings.m_ViewMode);
+@@ -145,10 +153,162 @@ bool CRendererDRMPRIME::Configure(const VideoPicture& picture, float fps, unsign
+   return true;
+ }
+ 
++bool CRendererDRMPRIME::CachePlaneParams(const VideoPicture& picture)
++{
++  auto* buffer = dynamic_cast<CVideoBufferDRMPRIME*>(picture.videoBuffer);
++  if (!buffer || !buffer->AcquireDescriptor())
++    return false;
++
++  const AVDRMFrameDescriptor* desc = buffer->GetDescriptor();
++  if (desc)
++  {
++    m_planeParams.format = desc->layers[0].format;
++    m_planeParams.modifier = desc->objects[0].format_modifier;
++    m_planeParams.width = buffer->GetWidth();
++    m_planeParams.height = buffer->GetHeight();
++  }
++  buffer->ReleaseDescriptor();
++
++  return desc != nullptr;
++}
++
++void CRendererDRMPRIME::EnsurePlanes()
++{
++  auto* winSystem = dynamic_cast<CWinSystemGbm*>(CServiceBroker::GetWinSystem());
++  if (!winSystem || m_planeParams.format == 0)
++    return;
++
++  auto drm = winSystem->GetDrm();
++
++  // A display mode change re-runs FindGuiPlane(), whose "reuse the existing gui
++  // plane" path drops the video plane - it assumes the single-plane model where
++  // one plane flips between the gui and video roles. Direct-to-Plane needs both,
++  // so claim the pair again or nothing is ever scanned out on the video plane.
++  if (!drm->GetVideoPlane())
++    drm->FindVideoAndGuiPlane(m_planeParams.format, m_planeParams.modifier, m_planeParams.width,
++                              m_planeParams.height);
++
++  // Same for the second video plane. Give up for good on failure rather than
++  // searching the planes on every frame.
++  if (m_stereoPlaneWanted && !drm->GetVideoPlane2())
++    m_stereoPlaneWanted = drm->FindSecondVideoPlane(m_planeParams.format, m_planeParams.modifier,
++                                                    m_planeParams.width, m_planeParams.height);
++}
++
++bool CRendererDRMPRIME::SetStereoPlaneGeometry()
++{
++  auto& gfxContext = CServiceBroker::GetWinSystem()->GetGfxContext();
++  const RenderStereoMode stereoMode = gfxContext.GetStereoMode();
++  if (stereoMode != RenderStereoMode::SPLIT_VERTICAL &&
++      stereoMode != RenderStereoMode::SPLIT_HORIZONTAL)
++    return false;
++
++  auto* winSystem = dynamic_cast<CWinSystemGbm*>(CServiceBroker::GetWinSystem());
++  if (!winSystem || !winSystem->GetDrm()->GetVideoPlane2())
++    return SetPackedPlaneGeometry(stereoMode);
++
++  // One plane per eye. CBaseRenderer::ManageRenderArea() crops the source to the
++  // eye of the current view and fits it to the halved screen GetResInfo()
++  // reports for a split mode, and StereoCorrection() then places that half where
++  // the sink expects it - below the active space gap for frame packing. So both
++  // the source layout and the output layout are handled by the shared code, and
++  // a side-by-side source on a top-and-bottom display just works.
++  const RenderStereoView view = gfxContext.GetStereoView();
++
++  gfxContext.SetStereoView(RenderStereoView::LEFT);
++  CBaseRenderer::ManageRenderArea();
++  m_planeSourceRect = m_sourceRect;
++  m_planeDestRect = gfxContext.StereoCorrection(m_destRect);
++
++  gfxContext.SetStereoView(RenderStereoView::RIGHT);
++  CBaseRenderer::ManageRenderArea();
++  m_planeSourceRect2 = m_sourceRect;
++  m_planeDestRect2 = gfxContext.StereoCorrection(m_destRect);
++
++  // Restore the view, and with it m_sourceRect / m_destRect for GetVideoRect().
++  gfxContext.SetStereoView(view);
++  CBaseRenderer::ManageRenderArea();
++
++  // Those rects are in GUI coordinates - the resolution's iWidth x iHeight - but
++  // a plane scans out in physical coordinates, iScreenWidth x iScreenHeight. The
++  // two differ when the GUI is rendered smaller than the mode (limitguisize),
++  // where the GUI plane is scaled up to the mode; without scaling the eyes would
++  // cover only the GUI-sized corner of the screen.
++  const RESOLUTION_INFO base =
++      CDisplaySettings::GetInstance().GetResolutionInfo(gfxContext.GetVideoResolution());
++  if (base.iWidth > 0 && base.iHeight > 0 &&
++      (base.iScreenWidth != base.iWidth || base.iScreenHeight != base.iHeight))
++  {
++    const float scaleX = static_cast<float>(base.iScreenWidth) / static_cast<float>(base.iWidth);
++    const float scaleY = static_cast<float>(base.iScreenHeight) / static_cast<float>(base.iHeight);
++    const auto toScanout = [scaleX, scaleY](CRect& rect)
++    {
++      rect.x1 *= scaleX;
++      rect.x2 *= scaleX;
++      rect.y1 *= scaleY;
++      rect.y2 *= scaleY;
++    };
++
++    toScanout(m_planeDestRect);
++    toScanout(m_planeDestRect2);
++  }
++
++  m_planeCount = 2;
++  return true;
++}
++
++bool CRendererDRMPRIME::SetPackedPlaneGeometry(RenderStereoMode stereoMode)
++{
++  // Fallback with only one plane: it presents one buffer per commit and so
++  // cannot build a split, which needs two independent source->dest mappings.
++  // Scan out the whole packed frame across the whole screen instead - a 3D
++  // display consumes it directly. Frame packing comes out misaligned this way,
++  // as the active space gap cannot be reproduced by one uniform mapping.
++  m_planeSourceRect =
++      CRect(0.0f, 0.0f, static_cast<float>(m_sourceWidth), static_cast<float>(m_sourceHeight));
++
++  // One uniform mapping means the per-eye aspect can only be corrected on the
++  // axis both eyes share: vertically for side-by-side, horizontally for
++  // top-and-bottom. The other axis must span the full screen, or the eye
++  // boundary moves off the half the display expects and both eyes misalign.
++  const RESOLUTION_INFO info = CServiceBroker::GetWinSystem()->GetGfxContext().GetResInfo();
++  const float screenWidth = static_cast<float>(info.iScreenWidth);
++  const float screenHeight = static_cast<float>(info.iScreenHeight);
++  const float zoom = CDisplaySettings::GetInstance().GetZoomAmount();
++  const float aspect = GetPerEyeAspectRatio() * CDisplaySettings::GetInstance().GetPixelRatio();
++
++  float width = screenWidth;
++  float height = screenHeight;
++  if (aspect > 0.0f)
++  {
++    if (stereoMode == RenderStereoMode::SPLIT_VERTICAL)
++      height = std::min(screenHeight, screenWidth / aspect * zoom);
++    else
++      width = std::min(screenWidth, screenHeight * aspect * zoom);
++  }
++
++  const float x = (screenWidth - width) * 0.5f;
++  const float y = (screenHeight - height) * 0.5f;
++  m_planeDestRect = CRect(x, y, x + width, y + height);
++
++  m_planeCount = 1;
++  return true;
++}
++
+ void CRendererDRMPRIME::ManageRenderArea()
+ {
+   CBaseRenderer::ManageRenderArea();
+ 
++  EnsurePlanes();
++
++  if (SetStereoPlaneGeometry())
++    return;
++
++  // Whole frame, except for "watch as 2D" (MONO) of a stereoscopic source, where
++  // CBaseRenderer::ManageRenderArea() has cropped it to the eye to show.
++  m_planeCount = 1;
++  m_planeSourceRect = m_sourceRect;
++
+   RESOLUTION_INFO info = CServiceBroker::GetWinSystem()->GetGfxContext().GetResInfo();
+   if (info.iScreenWidth != info.iWidth)
+   {
+@@ -263,7 +423,9 @@ void CRendererDRMPRIME::RenderUpdate(
+   if (m_iLastRenderBuffer == -1)
+     m_videoLayerBridge->Configure(buffer);
+ 
+-  m_videoLayerBridge->SetVideoPlane(buffer, m_planeDestRect);
++  const std::array<CVideoLayerBridgeDRMPRIME::PlaneRects, 2> rects{
++      {{m_planeSourceRect, m_planeDestRect}, {m_planeSourceRect2, m_planeDestRect2}}};
++  m_videoLayerBridge->SetVideoPlane(buffer, std::span(rects).first(m_planeCount));
+ 
+   m_iLastRenderBuffer = index;
+ }
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.h b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.h
+index 11cb03dee5..968ae78367 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.h
+@@ -9,6 +9,7 @@
+ #pragma once
+ 
+ #include "cores/VideoPlayer/VideoRenderers/BaseRenderer.h"
++#include "rendering/RenderSystemTypes.h"
+ 
+ class CVideoBuffer;
+ class CVideoLayerBridgeDRMPRIME;
+@@ -49,9 +50,36 @@ protected:
+   void ManageRenderArea() override;
+ 
+ private:
++  //! \brief Geometry for a split stereo mode. False for any other mode, leaving
++  //!        the geometry to ManageRenderArea.
++  bool SetStereoPlaneGeometry();
++  //! \brief Single-plane fallback: the whole packed frame on the whole screen.
++  bool SetPackedPlaneGeometry(RenderStereoMode stereoMode);
++  //! \brief Record what the video plane(s) have to be able to scan out.
++  bool CachePlaneParams(const VideoPicture& picture);
++  //! \brief Reclaim any video plane a display mode change has taken away.
++  void EnsurePlanes();
++
+   bool m_bConfigured = false;
+   int m_iLastRenderBuffer = -1;
++
++  //! Buffer properties the video plane(s) have to support, cached so a plane
++  //! can be reclaimed after a reassignment.
++  struct
++  {
++    uint32_t format{0};
++    uint64_t modifier{0};
++    uint64_t width{0};
++    uint64_t height{0};
++  } m_planeParams;
++  bool m_stereoPlaneWanted{false};
++
++  //! Number of video planes in use: 2 while scanning out an eye per plane.
++  size_t m_planeCount{1};
++  CRect m_planeSourceRect;
+   CRect m_planeDestRect;
++  CRect m_planeSourceRect2;
++  CRect m_planeDestRect2;
+ 
+   std::shared_ptr<CVideoLayerBridgeDRMPRIME> m_videoLayerBridge;
+ 
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/VideoLayerBridgeDRMPRIME.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/VideoLayerBridgeDRMPRIME.cpp
+index 8e63c3ceba..ceb4e55f03 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/VideoLayerBridgeDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/VideoLayerBridgeDRMPRIME.cpp
+@@ -16,6 +16,8 @@
+ #include "windowing/gbm/drm/DRMAtomic.h"
+ 
+ #include <algorithm>
++#include <cmath>
++#include <cstdint>
+ #include <utility>
+ 
+ using namespace KODI::WINDOWING::GBM;
+@@ -45,6 +47,12 @@ void CVideoLayerBridgeDRMPRIME::Disable()
+   // disable video plane
+   m_DRM->AddProperty(plane, "FB_ID", 0);
+   m_DRM->AddProperty(plane, "CRTC_ID", 0);
++
++  if (auto* plane2 = m_DRM->GetVideoPlane2())
++  {
++    m_DRM->AddProperty(plane2, "FB_ID", 0);
++    m_DRM->AddProperty(plane2, "CRTC_ID", 0);
++  }
+ }
+ 
+ void CVideoLayerBridgeDRMPRIME::Acquire(CVideoBufferDRMPRIME* buffer, uint32_t fbId)
+@@ -201,40 +209,70 @@ void CVideoLayerBridgeDRMPRIME::Configure(CVideoBufferDRMPRIME* buffer)
+ 
+   const VideoPicture& picture = buffer->GetPicture();
+ 
+-  std::optional<uint64_t> colorEncoding =
+-      plane->GetPropertyEnumValue("COLOR_ENCODING", GetColorEncoding(picture));
+-  if (colorEncoding)
+-    m_DRM->AddProperty(plane, "COLOR_ENCODING", colorEncoding.value());
++  for (auto* p : {plane, m_DRM->GetVideoPlane2()})
++  {
++    if (!p)
++      continue;
++
++    std::optional<uint64_t> colorEncoding =
++        p->GetPropertyEnumValue("COLOR_ENCODING", GetColorEncoding(picture));
++    if (colorEncoding)
++      m_DRM->AddProperty(p, "COLOR_ENCODING", colorEncoding.value());
++
++    std::optional<uint64_t> colorRange =
++        p->GetPropertyEnumValue("COLOR_RANGE", GetColorRange(picture));
++    if (colorRange)
++      m_DRM->AddProperty(p, "COLOR_RANGE", colorRange.value());
++  }
+ 
+-  std::optional<uint64_t> colorRange =
+-      plane->GetPropertyEnumValue("COLOR_RANGE", GetColorRange(picture));
+-  if (colorRange)
+-    m_DRM->AddProperty(plane, "COLOR_RANGE", colorRange.value());
+ }
+ 
+-void CVideoLayerBridgeDRMPRIME::SetVideoPlane(CVideoBufferDRMPRIME* buffer, const CRect& destRect)
++void CVideoLayerBridgeDRMPRIME::SetPlaneRects(CDRMPlane* plane,
++                                              CVideoBufferDRMPRIME* buffer,
++                                              const PlaneRects& rects)
+ {
+-  auto plane = m_DRM->GetVideoPlane();
+-  if (!plane)
+-    return;
+-
+-  if (!PrepareBuffer(buffer))
+-    return;
++  // Buffer dimensions equal the picture dimensions, so the source rect maps
++  // straight to the plane crop. SRC_* are 16.16 fixed point, which exists so a
++  // crop can start and end between pixels - that is how a plane pans and zooms
++  // smoothly. Keep the fractional part rather than truncating to whole pixels,
++  // and leave any alignment the hardware needs to the driver: userspace cannot
++  // enumerate that constraint, and the property advertises fractional support.
++  // Clamp the edges to the buffer and derive the size from them so the crop
++  // stays consistent, falling back to the whole buffer if it is empty.
++  constexpr int64_t fpOne = 1 << 16;
++  const int64_t bufferWidth = static_cast<int64_t>(buffer->GetWidth()) * fpOne;
++  const int64_t bufferHeight = static_cast<int64_t>(buffer->GetHeight()) * fpOne;
++
++  const auto toFixed = [](float value)
++  { return static_cast<int64_t>(std::lround(static_cast<double>(value) * fpOne)); };
++
++  int64_t srcX = std::clamp<int64_t>(toFixed(rects.source.x1), 0, bufferWidth);
++  int64_t srcY = std::clamp<int64_t>(toFixed(rects.source.y1), 0, bufferHeight);
++  int64_t srcW = std::clamp<int64_t>(toFixed(rects.source.x2), srcX, bufferWidth) - srcX;
++  int64_t srcH = std::clamp<int64_t>(toFixed(rects.source.y2), srcY, bufferHeight) - srcY;
++  if (srcW == 0 || srcH == 0)
++  {
++    srcX = srcY = 0;
++    srcW = bufferWidth;
++    srcH = bufferHeight;
++  }
+ 
+   m_DRM->AddProperty(plane, "FB_ID", m_fb_id);
+   m_DRM->AddProperty(plane, "CRTC_ID", m_DRM->GetCrtc()->GetCrtcId());
+-  m_DRM->AddProperty(plane, "SRC_X", 0);
+-  m_DRM->AddProperty(plane, "SRC_Y", 0);
+-  m_DRM->AddProperty(plane, "SRC_W", buffer->GetWidth() << 16);
+-  m_DRM->AddProperty(plane, "SRC_H", buffer->GetHeight() << 16);
++  m_DRM->AddProperty(plane, "SRC_X", static_cast<uint64_t>(srcX));
++  m_DRM->AddProperty(plane, "SRC_Y", static_cast<uint64_t>(srcY));
++  m_DRM->AddProperty(plane, "SRC_W", static_cast<uint64_t>(srcW));
++  m_DRM->AddProperty(plane, "SRC_H", static_cast<uint64_t>(srcH));
+   // The CRTC rect addresses the composited output, which is not subsampled, so
+-  // it needs no even alignment - and must not be forced to it, or any odd
+-  // coordinate becomes unreachable. Program the rounded edges, which also keeps
+-  // the position and the size consistent with each other.
+-  const int32_t dstX1 = MathUtils::round_int(static_cast<double>(destRect.x1));
+-  const int32_t dstY1 = MathUtils::round_int(static_cast<double>(destRect.y1));
+-  const int32_t dstX2 = MathUtils::round_int(static_cast<double>(destRect.x2));
+-  const int32_t dstY2 = MathUtils::round_int(static_cast<double>(destRect.y2));
++  // it needs no even alignment - and must not be forced to it. Frame packing
++  // starts the second eye at vdisplay + vblank, which is odd for 1080p24
++  // (1080 + 45 = 1125); rounding that down to 1124 shifts one eye up a line and
++  // takes its last line from the active space gap. Use the rounded edges so the
++  // position and the size stay consistent with each other.
++  const int32_t dstX1 = MathUtils::round_int(static_cast<double>(rects.dest.x1));
++  const int32_t dstY1 = MathUtils::round_int(static_cast<double>(rects.dest.y1));
++  const int32_t dstX2 = MathUtils::round_int(static_cast<double>(rects.dest.x2));
++  const int32_t dstY2 = MathUtils::round_int(static_cast<double>(rects.dest.y2));
+ 
+   m_DRM->AddProperty(plane, "CRTC_X", dstX1);
+   m_DRM->AddProperty(plane, "CRTC_Y", dstY1);
+@@ -242,6 +280,33 @@ void CVideoLayerBridgeDRMPRIME::SetVideoPlane(CVideoBufferDRMPRIME* buffer, cons
+   m_DRM->AddProperty(plane, "CRTC_H", static_cast<uint32_t>(std::max(0, dstY2 - dstY1)));
+ }
+ 
++void CVideoLayerBridgeDRMPRIME::SetVideoPlane(CVideoBufferDRMPRIME* buffer,
++                                              std::span<const PlaneRects> rects)
++{
++  CDRMPlane* planes[] = {m_DRM->GetVideoPlane(), m_DRM->GetVideoPlane2()};
++  if (!planes[0] || rects.empty())
++    return;
++
++  if (!PrepareBuffer(buffer))
++    return;
++
++  size_t used = 0;
++  for (auto* plane : planes)
++  {
++    if (!plane || used == rects.size())
++      break;
++    SetPlaneRects(plane, buffer, rects[used++]);
++  }
++
++  // Detach a claimed second plane that this frame does not use, so a switch out
++  // of a split stereo mode does not leave the second eye on screen.
++  if (planes[1] && used < 2)
++  {
++    m_DRM->AddProperty(planes[1], "FB_ID", 0);
++    m_DRM->AddProperty(planes[1], "CRTC_ID", 0);
++  }
++}
++
+ void CVideoLayerBridgeDRMPRIME::UpdateVideoPlane()
+ {
+   if (!m_buffer || !m_fb_id)
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/VideoLayerBridgeDRMPRIME.h b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/VideoLayerBridgeDRMPRIME.h
+index 276cf279cc..a3a40402c3 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/VideoLayerBridgeDRMPRIME.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/VideoLayerBridgeDRMPRIME.h
+@@ -13,6 +13,7 @@
+ #include "windowing/gbm/VideoLayerBridge.h"
+ 
+ #include <memory>
++#include <span>
+ 
+ #include <drm_mode.h>
+ 
+@@ -23,6 +24,7 @@ namespace WINDOWING
+ namespace GBM
+ {
+ class CDRMAtomic;
++class CDRMPlane;
+ }
+ } // namespace WINDOWING
+ } // namespace KODI
+@@ -32,12 +34,27 @@ class CVideoBufferDRMPRIME;
+ class CVideoLayerBridgeDRMPRIME : public KODI::WINDOWING::GBM::CVideoLayerBridge
+ {
+ public:
++  //! \brief One scanout rectangle pair: a crop of the buffer onto a screen area.
++  struct PlaneRects
++  {
++    CRect source;
++    CRect dest;
++  };
++
+   CVideoLayerBridgeDRMPRIME(std::shared_ptr<KODI::WINDOWING::GBM::CDRMAtomic> drm);
+   ~CVideoLayerBridgeDRMPRIME() override;
+   void Disable() override;
+ 
+   virtual void Configure(CVideoBufferDRMPRIME* buffer);
+-  virtual void SetVideoPlane(CVideoBufferDRMPRIME* buffer, const CRect& destRect);
++
++  /*!
++   * \brief Scan the buffer out on the video plane(s).
++   *
++   * One entry presents the buffer on the single video plane. Two entries need
++   * a second video plane and present one stereoscopic eye on each; the second
++   * is ignored if no second plane was claimed.
++   */
++  virtual void SetVideoPlane(CVideoBufferDRMPRIME* buffer, std::span<const PlaneRects> rects);
+   virtual void UpdateVideoPlane();
+ 
+ protected:
+@@ -49,6 +66,9 @@ private:
+   bool PrepareBuffer(CVideoBufferDRMPRIME* buffer);
+   //! \brief Convert the buffer's descriptor to a framebuffer; 0 on failure.
+   uint32_t CreateFramebuffer(CVideoBufferDRMPRIME* buffer);
++  void SetPlaneRects(KODI::WINDOWING::GBM::CDRMPlane* plane,
++                     CVideoBufferDRMPRIME* buffer,
++                     const PlaneRects& rects);
+ 
+   static constexpr size_t MAX_FB_CACHE = 32;
+ 
+diff --git a/xbmc/windowing/gbm/drm/DRMAtomic.cpp b/xbmc/windowing/gbm/drm/DRMAtomic.cpp
+index 55a7a0e1ea..deb39700f3 100644
+--- a/xbmc/windowing/gbm/drm/DRMAtomic.cpp
++++ b/xbmc/windowing/gbm/drm/DRMAtomic.cpp
+@@ -51,6 +51,8 @@ void CDRMAtomic::DrmAtomicCommit(int fb_id, int flags, bool rendered, bool video
+         continue;
+       if (m_video_plane != nullptr && m_video_plane->GetId() == plane->GetId())
+         continue;
++      if (m_video_plane2 != nullptr && m_video_plane2->GetId() == plane->GetId())
++        continue;
+ 
+       uint64_t planeid = plane->GetPropertyValue("CRTC_ID").value_or(0);
+       if (planeid == m_crtc->GetId() || planeid == m_old_crtc->GetId())
+diff --git a/xbmc/windowing/gbm/drm/DRMUtils.cpp b/xbmc/windowing/gbm/drm/DRMUtils.cpp
+index 3e126295e5..9146806dd0 100644
+--- a/xbmc/windowing/gbm/drm/DRMUtils.cpp
++++ b/xbmc/windowing/gbm/drm/DRMUtils.cpp
+@@ -167,6 +167,10 @@ bool CDRMUtils::FindGuiPlane(uint32_t format, uint64_t modifier)
+     return false;
+   }
+ 
++  // Any plane reassignment invalidates the stereoscopic second video plane; it
++  // is re-acquired by the renderer if still needed.
++  m_video_plane2 = nullptr;
++
+   const PlaneType plane_type = HasQuirk(QUIRK_NEEDSPRIMARY) ? PLANE_TYPE_PRIMARY : PLANE_TYPE_ANY;
+   const RESOLUTION_INFO res = GetCurrentMode();
+ 
+@@ -240,6 +244,8 @@ bool CDRMUtils::FindVideoPlane(uint32_t format, uint64_t modifier)
+     return false;
+   }
+ 
++  m_video_plane2 = nullptr;
++
+   const PlaneType plane_type = HasQuirk(QUIRK_NEEDSPRIMARY) ? PLANE_TYPE_PRIMARY : PLANE_TYPE_ANY;
+   const RESOLUTION_INFO res = GetCurrentMode();
+ 
+@@ -321,6 +327,8 @@ bool CDRMUtils::FindVideoAndGuiPlane(uint32_t format,
+       return true;
+   }
+ 
++  m_video_plane2 = nullptr;
++
+   for (auto& crtc : m_encoder->GetPossibleCrtcs(m_crtcs, m_crtc))
+   {
+     for (auto& gui_plane : m_planes)
+@@ -368,6 +376,46 @@ bool CDRMUtils::FindVideoAndGuiPlane(uint32_t format,
+   return false;
+ }
+ 
++bool CDRMUtils::FindSecondVideoPlane(uint32_t format,
++                                     uint64_t modifier,
++                                     uint64_t width,
++                                     uint64_t height)
++{
++  // Only meaningful alongside a dedicated video plane, i.e. Direct-to-Plane.
++  if (!m_crtc || !m_gui_plane || !m_video_plane)
++    return false;
++
++  if (m_video_plane2 &&
++      m_video_plane2->Check(width, height, format, modifier, m_crtc, PLANE_TYPE_ANY))
++    return true;
++
++  for (auto& plane : m_planes)
++  {
++    if (plane->GetId() == m_gui_plane->GetId() || plane->GetId() == m_video_plane->GetId())
++      continue;
++
++    // The two video planes never overlap, so only their order against the gui
++    // plane matters.
++    if (!plane->Check(width, height, format, modifier, m_crtc, PLANE_TYPE_ANY) ||
++        !m_gui_plane->MoveOnTopOf(plane.get()))
++      continue;
++
++    plane->SetFormat(format);
++    plane->SetModifier(modifier);
++    m_video_plane2 = plane.get();
++
++    CLog::LogF(LOGINFO,
++               "Using second video plane [{}x{}] id:{}, format:{}, modifier:{}, crtc id:{}", width,
++               height, m_video_plane2->GetId(), DRMHELPERS::FourCCToString(format),
++               DRMHELPERS::ModifierToString(modifier), m_crtc->GetId());
++    return true;
++  }
++
++  CLog::LogF(LOGDEBUG, "No second video plane available for [{}x{}] format:{}, modifier:{}", width,
++             height, DRMHELPERS::FourCCToString(format), DRMHELPERS::ModifierToString(modifier));
++  return false;
++}
++
+ void CDRMUtils::PrintDrmDeviceInfo(drmDevicePtr device)
+ {
+   std::string message;
+diff --git a/xbmc/windowing/gbm/drm/DRMUtils.h b/xbmc/windowing/gbm/drm/DRMUtils.h
+index db4d756946..df713b48cd 100644
+--- a/xbmc/windowing/gbm/drm/DRMUtils.h
++++ b/xbmc/windowing/gbm/drm/DRMUtils.h
+@@ -65,6 +65,7 @@ public:
+   int GetRenderNodeFileDescriptor() const { return m_renderFd; }
+   const char* GetRenderDevicePath() const { return m_renderDevicePath; }
+   CDRMPlane* GetVideoPlane() const { return m_video_plane; }
++  CDRMPlane* GetVideoPlane2() const { return m_video_plane2; }
+   CDRMPlane* GetGuiPlane() const { return m_gui_plane; }
+   CDRMCrtc* GetCrtc() const { return m_crtc; }
+   CDRMConnector* GetConnector() const { return m_connector; }
+@@ -75,6 +76,14 @@ public:
+   // FindGuiPlane never releases a D2P video plane reservation; a caller that
+   // means "video is over" states it here before revalidating the gui plane.
+   void ReleaseVideoPlane() { m_video_plane = nullptr; }
++
++  /*!
++   * \brief Claim a second video plane below the gui plane, so stereoscopic
++   *        playback can scan out one eye per plane. Optional: on failure the
++   *        caller keeps using the single video plane.
++   */
++  bool FindSecondVideoPlane(uint32_t format, uint64_t modifier, uint64_t width, uint64_t height);
++
+   bool HasQuirk(int quirk) const { return m_drm_quirks & quirk; }
+ 
+   std::vector<std::string> GetConnectedConnectorNames();
+@@ -101,6 +110,8 @@ protected:
+   CDRMCrtc* m_old_crtc{nullptr};
+   CDRMCrtc* m_orig_crtc{nullptr};
+   CDRMPlane* m_video_plane{nullptr};
++  //! Second video plane, only held while scanning out stereoscopic content.
++  CDRMPlane* m_video_plane2{nullptr};
+   CDRMPlane* m_gui_plane{nullptr};
+   drmModeModeInfo* m_mode = nullptr;
+ 
+-- 
+2.56.0
+

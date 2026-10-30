@@ -1,0 +1,28 @@
+From b0327305db692866ebd302f3e4d7254dd4d6d08d Mon Sep 17 00:00:00 2001
+From: Jonas Karlman <jonas@kwiboo.se>
+Date: Wed, 17 Dec 2025 00:45:07 +0000
+Subject: [PATCH 2003/2064] VideoLayerBridgeDRMPRIME: release buffer early
+
+(cherry picked from commit d0bc81002c4bb7d1864b50375348dfaf7019a0b9)
+---
+ .../VideoRenderers/HwDecRender/VideoLayerBridgeDRMPRIME.cpp   | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/VideoLayerBridgeDRMPRIME.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/VideoLayerBridgeDRMPRIME.cpp
+index 54509e2ee5..e1d20d8694 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/VideoLayerBridgeDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/VideoLayerBridgeDRMPRIME.cpp
+@@ -236,6 +236,10 @@ void CVideoLayerBridgeDRMPRIME::UpdateVideoPlane()
+   if (!m_buffer || !m_fb_id)
+     return;
+ 
++  // release the buffer that is no longer presented on screen
++  Release(m_prev_buffer);
++  m_prev_buffer = nullptr;
++
+   auto plane = m_DRM->GetVideoPlane();
+   if (!plane)
+     return;
+-- 
+2.56.0
+

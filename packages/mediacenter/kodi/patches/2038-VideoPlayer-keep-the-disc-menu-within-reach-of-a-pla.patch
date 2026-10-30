@@ -1,0 +1,295 @@
+From c4323ce5feb5070b0dcd8fb353109189c18cb75c Mon Sep 17 00:00:00 2001
+From: Dom Cobley <popcornmix@gmail.com>
+Date: Fri, 28 Aug 2026 13:01:23 +0100
+Subject: [PATCH 2038/2064] VideoPlayer: keep the disc menu within reach of a
+ playlist
+
+A disc played as one of its playlists has no way back to the disc's own menu.
+The OSD offers nothing, because a menu is only offered while one is being
+navigated, and the choice before playback is gone once a playlist is known: a
+library entry holds the playlist the scan settled on, so automatic menu
+selection sees a playlist and does not ask. The disc's menu is then unreachable
+for as long as the entry lives, which is what people notice.
+
+Say separately from the menu being navigated that one could be, and let the
+player act on it. Not the menu type: that describes what is being navigated now,
+and whether it is NONE decides how streams are opened and how the demuxer is
+synchronised, so widening it would change how every playlist plays.
+
+Asking libbluray for a menu while it is playing a playlist gets nowhere - it
+never entered navigation mode - so play the disc again as a menu path, which is
+what choosing the menu beforehand would have done. Two things in the way of that
+trip, both of which decide the item is still the playlist it came from:
+
+The path is settled again on the way through, and an item whose tag names a
+bluray:// path has the tag's path put back over it. For a library entry that is
+the playlist, so the menu has to be written to the tag as well or it does not
+survive.
+
+Then what to play is decided again, and a playlist search would be run for the
+menu - answering nothing, and taking a "simple menu" or "main title" setting
+straight back off the menu. A path that is already a menu has had that decision
+made, so leave it alone. This also makes the existing route to the menu
+idempotent, which it was not.
+
+Seen on a 3D disc whose menu the disc's own navigator reaches: the action now
+opens the menu path, and the disc navigates to its top title. What the menu then
+draws is the disc's business - a BD-J one still needs a JVM libbluray can load.
+
+(cherry picked from commit 1354a79c65d134eb724c4d91ba830ad694aa38f9)
+---
+ xbmc/application/ApplicationPlay.cpp          |  6 +++
+ xbmc/application/ApplicationPlayer.cpp        | 10 ++++
+ xbmc/application/ApplicationPlayer.h          |  1 +
+ xbmc/cores/IPlayer.h                          |  7 +++
+ .../DVDInputStreams/DVDInputStreamBluray.cpp  | 13 +++++
+ .../DVDInputStreams/DVDInputStreamBluray.h    | 11 ++++
+ xbmc/cores/VideoPlayer/VideoPlayer.cpp        | 51 +++++++++++++++++++
+ xbmc/cores/VideoPlayer/VideoPlayer.h          | 10 ++++
+ xbmc/guilib/guiinfo/VideoGUIInfo.cpp          |  5 +-
+ 9 files changed, 113 insertions(+), 1 deletion(-)
+
+diff --git a/xbmc/application/ApplicationPlay.cpp b/xbmc/application/ApplicationPlay.cpp
+index 818e5037d1..e7adcf22b5 100644
+--- a/xbmc/application/ApplicationPlay.cpp
++++ b/xbmc/application/ApplicationPlay.cpp
+@@ -199,6 +199,12 @@ MenuDecision GetMenuDecisions(const CFileItem& item,
+   if (isExternalPlayer || isRemotePlayer)
+     return NO_ACTION;
+ 
++  // Already a menu path, so the choice of what to play has been made - by the setting, by
++  // the context menu, or by leaving a playlist for the disc's own menu. The searches below
++  // would only take it back off the menu, and a playlist search cannot be answered for one.
++  if (URIUtils::IsBlurayMenuPath(item.GetDynPath()))
++    return NO_ACTION;
++
+   // See if disc image is a Blu-ray (as an image could be a DVD as well) or if the path is a BDMV folder
+   const bool isBluray{::UTILS::DISCS::IsBlurayDiscImage(item) ||
+                       URIUtils::IsBDFile(item.GetDynPath())};
+diff --git a/xbmc/application/ApplicationPlayer.cpp b/xbmc/application/ApplicationPlayer.cpp
+index 2938369d9b..9df443f5a9 100644
+--- a/xbmc/application/ApplicationPlayer.cpp
++++ b/xbmc/application/ApplicationPlayer.cpp
+@@ -468,6 +468,16 @@ MenuType CApplicationPlayer::GetSupportedMenuType() const
+   return player->GetSupportedMenuType();
+ }
+ 
++bool CApplicationPlayer::CanShowDiscMenu() const
++{
++  std::shared_ptr<const IPlayer> player = GetInternal();
++  if (!player)
++  {
++    return false;
++  }
++  return player->CanShowDiscMenu();
++}
++
+ int CApplicationPlayer::GetCacheLevel() const
+ {
+   std::shared_ptr<const IPlayer> player = GetInternal();
+diff --git a/xbmc/application/ApplicationPlayer.h b/xbmc/application/ApplicationPlayer.h
+index 094c4d19c1..3999fa504d 100644
+--- a/xbmc/application/ApplicationPlayer.h
++++ b/xbmc/application/ApplicationPlayer.h
+@@ -121,6 +121,7 @@ public:
+    * \return The supported menu type
+   */
+   MenuType GetSupportedMenuType() const;
++  bool CanShowDiscMenu() const;
+ 
+   bool HasVideo() const;
+   bool HasGame() const;
+diff --git a/xbmc/cores/IPlayer.h b/xbmc/cores/IPlayer.h
+index 5f96bc31d3..1b2184e9dd 100644
+--- a/xbmc/cores/IPlayer.h
++++ b/xbmc/cores/IPlayer.h
+@@ -207,6 +207,13 @@ public:
+   */
+   virtual MenuType GetSupportedMenuType() const { return MenuType::NONE; }
+ 
++  /*!
++   * \brief Whether a disc menu can be reached from what is playing, even though it is not
++   *        what is being navigated now. Acting on it restarts playback at the menu.
++   * \return true if a disc menu is available to switch to
++   */
++  virtual bool CanShowDiscMenu() const { return false; }
++
+   virtual bool OnAction(const CAction& action) { return false; }
+ 
+   //returns a state that is needed for resuming from a specific time
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.cpp b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.cpp
+index e1615ef6f7..595e25e3cf 100644
+--- a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.cpp
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.cpp
+@@ -1524,6 +1524,19 @@ MenuType CDVDInputStreamBluray::GetSupportedMenuType()
+   return MenuType::NONE;
+ }
+ 
++bool CDVDInputStreamBluray::CanShowDiscMenu() const
++{
++  // In navigation mode the menu is already a keypress away, through OnMenu().
++  if (m_navmode || !m_bd)
++    return false;
++
++  const BLURAY_DISC_INFO* discInfo{bd_get_disc_info(m_bd)};
++
++  // Same question CBlurayDirectory::HasMenuSupport() answers when it decides whether to
++  // offer the menu alongside the titles, so a disc offers it in both places or neither.
++  return discInfo && !discInfo->no_menu_support;
++}
++
+ void CDVDInputStreamBluray::SetupPlayerSettings()
+ {
+   int region = CServiceBroker::GetSettingsComponent()->GetSettings()->GetInt(CSettings::SETTING_BLURAY_PLAYERREGION);
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.h b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.h
+index cae07e5df4..792ba84af5 100644
+--- a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.h
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.h
+@@ -110,6 +110,17 @@ public:
+   */
+   MenuType GetSupportedMenuType() override;
+ 
++  /*!
++   * \brief Whether the disc holds a menu that is not currently being navigated.
++   *
++   * A playlist played on its own never enters navigation mode, so OnMenu() has nothing to
++   * ask libbluray for and the disc's own menu is out of reach. Playing the disc again as a
++   * menu path is the way back to it, and this says whether that is worth offering.
++   *
++   * \return true if the disc supports menus and this is not already navigation mode
++   */
++  bool CanShowDiscMenu() const;
++
+   bool IsInMenu() override;
+   bool OnMouseMove(const CPoint &point) override  { return MouseMove(point); }
+   bool OnMouseClick(const CPoint &point) override { return MouseClick(point); }
+diff --git a/xbmc/cores/VideoPlayer/VideoPlayer.cpp b/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+index b501581ace..02356fd056 100644
+--- a/xbmc/cores/VideoPlayer/VideoPlayer.cpp
++++ b/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+@@ -5172,6 +5172,13 @@ bool CVideoPlayer::OnAction(const CAction &action)
+           // Let everyone know that we've gone to the menu
+           CServiceBroker::GetAnnouncementManager()->Announce(ANNOUNCEMENT::Player, "OnMenu");
+         }
++        else if (CanShowDiscMenu())
++        {
++          // A playlist playing on its own is not navigating the disc, so there is no menu
++          // for libbluray to be asked for. Play the disc as a menu path instead, which is
++          // the same thing choosing the menu before playback would have done.
++          ShowDiscMenu();
++        }
+         return true;
+       }
+       break;
+@@ -5378,6 +5385,45 @@ MenuType CVideoPlayer::GetSupportedMenuType() const
+   return m_State.menuType;
+ }
+ 
++bool CVideoPlayer::CanShowDiscMenu() const
++{
++  std::unique_lock lock(m_StateSection);
++  return m_State.canShowDiscMenu;
++}
++
++void CVideoPlayer::ShowDiscMenu()
++{
++  const std::string menuPath{URIUtils::GetBlurayMenuPath(m_item.GetDynPath())};
++  if (menuPath.empty())
++  {
++    CLog::LogF(LOGERROR, "Unable to derive a menu path from {}",
++               CURL::GetRedacted(m_item.GetDynPath()));
++    return;
++  }
++
++  CLog::LogF(LOGDEBUG, "Restarting playback at {}", CURL::GetRedacted(menuPath));
++
++  auto menuItem{std::make_unique<CFileItem>(m_item)};
++  menuItem->SetPath(menuPath);
++  menuItem->SetDynPath(menuPath);
++
++  // CApplicationPlay::ResolvePath() puts the tag's own path back over the dynpath for
++  // anything already on a bluray:// path, which for a library item is the playlist that
++  // was playing. Leave nothing there to put back, or the menu never survives the trip.
++  if (menuItem->HasVideoInfoTag())
++  {
++    menuItem->GetVideoInfoTag()->SetPath(menuPath);
++    menuItem->GetVideoInfoTag()->SetFileNameAndPath(menuPath);
++  }
++
++  // The disc decides where a menu starts, and a resume position belonging to the playlist
++  // that was playing means nothing there.
++  menuItem->SetStartOffset(0);
++
++  CServiceBroker::GetAppMessenger()->PostMsg(TMSG_MEDIA_PLAY, 0, 0,
++                                            static_cast<void*>(menuItem.release()));
++}
++
+ std::string CVideoPlayer::GetPlayerState()
+ {
+   std::unique_lock lock(m_StateSection);
+@@ -5888,6 +5934,11 @@ void CVideoPlayer::UpdatePlayState(double timeout)
+       state.menuType = pMenu->GetSupportedMenuType();
+     }
+ 
++    // Unconditional: state starts as a copy of the last one, and opening a file without
++    // closing the player swaps the input stream underneath it.
++    const auto bluray{std::dynamic_pointer_cast<CDVDInputStreamBluray>(m_pInputStream)};
++    state.canShowDiscMenu = bluray && bluray->CanShowDiscMenu();
++
+     state.canpause = m_pInputStream->CanPause();
+ 
+     bool realtime = m_pInputStream->IsRealtime();
+diff --git a/xbmc/cores/VideoPlayer/VideoPlayer.h b/xbmc/cores/VideoPlayer/VideoPlayer.h
+index 5b313b11b9..d6c529e741 100644
+--- a/xbmc/cores/VideoPlayer/VideoPlayer.h
++++ b/xbmc/cores/VideoPlayer/VideoPlayer.h
+@@ -51,6 +51,7 @@ struct SPlayerState
+     player_state  = "";
+     isInMenu = false;
+     menuType = MenuType::NONE;
++    canShowDiscMenu = false;
+     chapter = 0;
+     chapters.clear();
+     rawChapters.clear();
+@@ -80,6 +81,11 @@ struct SPlayerState
+   std::string player_state; // full player state
+   bool isInMenu;
+   MenuType menuType;
++
++  //! Whether a disc menu could be switched to, which a playlist played on its own has but
++  //! is not navigating. Not menuType: that says what is being navigated now, and several
++  //! decisions key off it being NONE.
++  bool canShowDiscMenu;
+   bool streamsReady;
+ 
+   // 1-based current chapter, numbered among the chapters visible to the user (i.e. excluding
+@@ -317,6 +323,10 @@ public:
+    * \return The supported menu type
+   */
+   MenuType GetSupportedMenuType() const override;
++  bool CanShowDiscMenu() const override;
++
++  //! \brief Play what is playing again as a menu path, so the disc starts at its menu.
++  void ShowDiscMenu();
+ 
+   void SetSubTitleDelay(float fValue = 0.0f) override;
+   float GetSubTitleDelay() override;
+diff --git a/xbmc/guilib/guiinfo/VideoGUIInfo.cpp b/xbmc/guilib/guiinfo/VideoGUIInfo.cpp
+index b36bbe145f..3f3fe3f929 100644
+--- a/xbmc/guilib/guiinfo/VideoGUIInfo.cpp
++++ b/xbmc/guilib/guiinfo/VideoGUIInfo.cpp
+@@ -954,7 +954,10 @@ bool CVideoGUIInfo::GetBool(bool& value,
+           CServiceBroker::GetGUI()->GetWindowManager().GetActiveWindow() == WINDOW_FULLSCREEN_GAME;
+       return true;
+     case VIDEOPLAYER_HASMENU:
+-      value = m_appPlayer->GetSupportedMenuType() != MenuType::NONE;
++      // Either a menu is being navigated, or one can be switched to - a disc played as a
++      // playlist has a menu even though it is not in it.
++      value = m_appPlayer->GetSupportedMenuType() != MenuType::NONE ||
++              m_appPlayer->CanShowDiscMenu();
+       return true;
+     case VIDEOPLAYER_HASTELETEXT:
+       value = m_appPlayer->HasTeletextCache();
+-- 
+2.56.0
+

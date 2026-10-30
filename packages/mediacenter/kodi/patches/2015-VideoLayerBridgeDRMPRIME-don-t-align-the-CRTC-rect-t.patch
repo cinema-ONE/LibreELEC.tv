@@ -1,0 +1,82 @@
+From 77719459621ba2ff4793b35897ced87b808b057c Mon Sep 17 00:00:00 2001
+From: Dom Cobley <popcornmix@gmail.com>
+Date: Mon, 27 Jul 2026 18:58:54 +0100
+Subject: [PATCH 2015/2064] VideoLayerBridgeDRMPRIME: don't align the CRTC rect
+ to even coordinates
+
+The video plane's CRTC rectangle is rounded to even coordinates - the position
+down, the size up. That is unnecessary, self-inconsistent, and makes some
+placements unreachable.
+
+CRTC_X/Y/W/H address the composited output, which is not subsampled, so no
+alignment applies to them. The constraint that motivates even coordinates
+belongs to a subsampled source, where SRC_* would have to carry it, and there it
+is the driver's to apply: those properties are 16.16 fixed point, so userspace
+cannot express the constraint by rounding and cannot enumerate whether the
+hardware even has it. Rounding the position down while rounding the size up also
+leaves the two disagreeing - the rect can end a pixel beyond where the position
+implies, stretching an odd-sized video by a pixel.
+
+Any odd destination coordinate is silently moved a line or a column, so a
+vertical shift, an overscan calibration or a centred odd-height letterbox all
+land one off. HDMI frame packing cannot be placed at all: it starts the second
+eye at vdisplay + vblank, which is odd whenever the blanking is - 1080 + 45 =
+1125 for 1080p24, programmed as 1124, which shifts that eye up a line and takes
+its last line from the active space gap.
+
+Program the rounded edges instead, so the position and the size stay consistent
+with each other.
+
+Note this allows an odd CRTC_Y, which would change field parity in an interlaced
+mode.
+
+Fixes: 987b94da2e ("RendererDRMPRIME: align render area")
+(cherry picked from commit 15786697b0b1f4b44022f92c76dde7475c273f57)
+---
+ .../HwDecRender/VideoLayerBridgeDRMPRIME.cpp  | 19 +++++++++++++++----
+ 1 file changed, 15 insertions(+), 4 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/VideoLayerBridgeDRMPRIME.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/VideoLayerBridgeDRMPRIME.cpp
+index e1d20d8694..8e63c3ceba 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/VideoLayerBridgeDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/VideoLayerBridgeDRMPRIME.cpp
+@@ -10,10 +10,12 @@
+ 
+ #include "ServiceBroker.h"
+ #include "cores/VideoPlayer/Buffers/VideoBufferDRMPRIME.h"
++#include "utils/MathUtils.h"
+ #include "utils/log.h"
+ #include "windowing/WinSystem.h"
+ #include "windowing/gbm/drm/DRMAtomic.h"
+ 
++#include <algorithm>
+ #include <utility>
+ 
+ using namespace KODI::WINDOWING::GBM;
+@@ -225,10 +227,19 @@ void CVideoLayerBridgeDRMPRIME::SetVideoPlane(CVideoBufferDRMPRIME* buffer, cons
+   m_DRM->AddProperty(plane, "SRC_Y", 0);
+   m_DRM->AddProperty(plane, "SRC_W", buffer->GetWidth() << 16);
+   m_DRM->AddProperty(plane, "SRC_H", buffer->GetHeight() << 16);
+-  m_DRM->AddProperty(plane, "CRTC_X", static_cast<int32_t>(destRect.x1) & ~1);
+-  m_DRM->AddProperty(plane, "CRTC_Y", static_cast<int32_t>(destRect.y1) & ~1);
+-  m_DRM->AddProperty(plane, "CRTC_W", (static_cast<uint32_t>(destRect.Width()) + 1) & ~1);
+-  m_DRM->AddProperty(plane, "CRTC_H", (static_cast<uint32_t>(destRect.Height()) + 1) & ~1);
++  // The CRTC rect addresses the composited output, which is not subsampled, so
++  // it needs no even alignment - and must not be forced to it, or any odd
++  // coordinate becomes unreachable. Program the rounded edges, which also keeps
++  // the position and the size consistent with each other.
++  const int32_t dstX1 = MathUtils::round_int(static_cast<double>(destRect.x1));
++  const int32_t dstY1 = MathUtils::round_int(static_cast<double>(destRect.y1));
++  const int32_t dstX2 = MathUtils::round_int(static_cast<double>(destRect.x2));
++  const int32_t dstY2 = MathUtils::round_int(static_cast<double>(destRect.y2));
++
++  m_DRM->AddProperty(plane, "CRTC_X", dstX1);
++  m_DRM->AddProperty(plane, "CRTC_Y", dstY1);
++  m_DRM->AddProperty(plane, "CRTC_W", static_cast<uint32_t>(std::max(0, dstX2 - dstX1)));
++  m_DRM->AddProperty(plane, "CRTC_H", static_cast<uint32_t>(std::max(0, dstY2 - dstY1)));
+ }
+ 
+ void CVideoLayerBridgeDRMPRIME::UpdateVideoPlane()
+-- 
+2.56.0
+

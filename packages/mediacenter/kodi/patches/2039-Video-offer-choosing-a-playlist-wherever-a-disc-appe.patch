@@ -1,0 +1,115 @@
+From 6dd2669b519b709f84462d295c2c216e7546a49d Mon Sep 17 00:00:00 2001
+From: Dom Cobley <popcornmix@gmail.com>
+Date: Mon, 31 Aug 2026 21:11:54 +0100
+Subject: [PATCH 2039/2064] Video: offer choosing a playlist wherever a disc
+ appears
+
+Choosing which playlist of a disc to play is offered by the video windows, so it
+is missing everywhere else a disc can be played from - the home screen's widgets
+most of all, where an in progress movie is one keypress from playing and the
+choice belongs. A disc scanned into the library holds the playlist the scan
+settled on, so nothing asks before playback either, leaving no way at all to
+reach another playlist from a widget.
+
+Move it to the context menu items registered with the manager, which are offered
+for an item wherever it is shown, and drop the window's own button so it is not
+offered twice where both are gathered.
+
+Not visible for an item already on the disc's menu: it is not playing a playlist,
+so there is none to choose between. The window's button did not check that.
+
+(cherry picked from commit 820fbb729d2d598582242f2b9f31e51e72b5030d)
+---
+ xbmc/ContextMenuManager.cpp               |  1 +
+ xbmc/video/ContextMenus.cpp               | 18 ++++++++++++++++++
+ xbmc/video/ContextMenus.h                 |  7 +++++++
+ xbmc/video/windows/GUIWindowVideoBase.cpp | 11 ++---------
+ 4 files changed, 28 insertions(+), 9 deletions(-)
+
+diff --git a/xbmc/ContextMenuManager.cpp b/xbmc/ContextMenuManager.cpp
+index 14555ee39c..10a4a2a0a3 100644
+--- a/xbmc/ContextMenuManager.cpp
++++ b/xbmc/ContextMenuManager.cpp
+@@ -112,6 +112,7 @@ void CContextMenuManager::Init()
+       std::make_shared<CONTEXTMENU::CAddRemoveFavourite>(),
+       std::make_shared<CONTEXTMENU::CFavouritesTargetContextMenu>(),
+       std::make_shared<CONTEXTMENU::CVideoShowExtras>(),
++      std::make_shared<CONTEXTMENU::CVideoChoosePlaylist>(),
+   };
+ 
+   ReloadAddonItems();
+diff --git a/xbmc/video/ContextMenus.cpp b/xbmc/video/ContextMenus.cpp
+index 29700d8a47..b1b166c0b1 100644
+--- a/xbmc/video/ContextMenus.cpp
++++ b/xbmc/video/ContextMenus.cpp
+@@ -506,4 +506,22 @@ bool CVideoShowExtras::Execute(const std::shared_ptr<CFileItem>& item) const
+   return true;
+ }
+ 
++bool CVideoChoosePlaylist::IsVisible(const CFileItem& item) const
++{
++  // Only a disc has playlists to choose between, and one already on the disc's menu is not
++  // playing any of them.
++  return !item.IsFolder() && URIUtils::IsBlurayPath(item.GetDynPath()) &&
++         !URIUtils::IsBlurayMenuPath(item.GetDynPath());
++}
++
++bool CVideoChoosePlaylist::Execute(const std::shared_ptr<CFileItem>& item) const
++{
++  // Asks before playing whatever the disc playback setting would otherwise have decided,
++  // and the choices include the disc's own menu.
++  item->SetProperty("force_playlist_selection", true);
++
++  VIDEO::UTILS::PlayItem(item, "", ContentUtils::PlayMode::PLAY_ONLY_THIS);
++  return true;
++}
++
+ } // namespace CONTEXTMENU
+diff --git a/xbmc/video/ContextMenus.h b/xbmc/video/ContextMenus.h
+index a042de13df..fb2ba84e2e 100644
+--- a/xbmc/video/ContextMenus.h
++++ b/xbmc/video/ContextMenus.h
+@@ -155,4 +155,11 @@ struct CVideoShowExtras : CStaticContextMenuAction
+   bool Execute(const std::shared_ptr<CFileItem>& item) const override;
+ };
+ 
++struct CVideoChoosePlaylist : CStaticContextMenuAction
++{
++  CVideoChoosePlaylist() : CStaticContextMenuAction(13424) {} // Choose playlist
++  bool IsVisible(const CFileItem& item) const override;
++  bool Execute(const std::shared_ptr<CFileItem>& item) const override;
++};
++
+ } // namespace CONTEXTMENU
+diff --git a/xbmc/video/windows/GUIWindowVideoBase.cpp b/xbmc/video/windows/GUIWindowVideoBase.cpp
+index 9b1ee95acf..f4cd46f91c 100644
+--- a/xbmc/video/windows/GUIWindowVideoBase.cpp
++++ b/xbmc/video/windows/GUIWindowVideoBase.cpp
+@@ -888,10 +888,8 @@ void CGUIWindowVideoBase::GetContextButtons(int itemNumber, CContextButtons &but
+       if (PLAYLIST::IsSmartPlayList(*item) || PLAYLIST::IsSmartPlayList(*m_vecItems))
+         buttons.Add(CONTEXT_BUTTON_EDIT_SMART_PLAYLIST, 586);
+ 
+-      if (URIUtils::IsBlurayPath(item->GetDynPath()) && !item->IsFolder())
+-      {
+-        buttons.Add(CONTEXT_BUTTON_CHOOSE_PLAYLIST, 13424);
+-      }
++      // Choosing a playlist is CONTEXTMENU::CVideoChoosePlaylist, so that it is offered
++      // wherever the item appears rather than only in this window.
+     }
+   }
+   CGUIMediaWindow::GetContextButtons(itemNumber, buttons);
+@@ -952,11 +950,6 @@ bool CGUIWindowVideoBase::OnContextButton(int itemNumber, CONTEXT_BUTTON button)
+     return OnPlayAndQueueMedia(item);
+   case CONTEXT_BUTTON_PLAY_ONLY_THIS:
+     return OnPlayMedia(itemNumber);
+-  case CONTEXT_BUTTON_CHOOSE_PLAYLIST:
+-  {
+-    item->SetProperty("force_playlist_selection", true);
+-    return OnPlayMedia(itemNumber);
+-  }
+   default:
+     break;
+   }
+-- 
+2.56.0
+

@@ -1,0 +1,228 @@
+From 2a4b5e4f8a8bb8747aa59364e3f359f9bed4f1aa Mon Sep 17 00:00:00 2001
+From: Dom Cobley <popcornmix@gmail.com>
+Date: Sat, 22 Aug 2026 19:05:07 +0100
+Subject: [PATCH 2028/2064] VideoPlayer: keep a Blu-ray menu out of the
+ subtitles' way
+
+The top menu of a Blu-ray 3D disc is invisible. The buttons are live -- enter
+starts the feature -- and moving between them brings the menu into view, where
+it then stays. Only the first drawing of it is lost.
+
+The navigator's menu goes into the same overlay container as the subtitles, and
+everything in there is treated as one sequence of cues. Three things follow from
+that, all of which the menu has to survive. Closing a subtitle stream empties
+the container, so opening one throws away a menu drawn moments earlier. A cue
+arriving with no stop time of its own is taken to end whatever came before it,
+so the first subtitle gives the menu a stop time in the past. And a forced cue
+supersedes an older forced one, which a menu is.
+
+Between subtitles all three are right; between a subtitle and a menu none of
+them are. So say where an overlay came from: CDVDOverlay carries a source, a
+subtitle stream unless told otherwise, and the navigator marks its pages as the
+menu. Ending and superseding then apply within a source and not across two, so
+the menu still goes when the next page replaces it or the navigator closes it
+with an empty one -- which is what takes it off the screen when a scene starts
+playing -- but a subtitle appearing over the top of it changes nothing. Closing
+a subtitle stream clears the subtitles and only the subtitles, so WebVTT cues
+behave exactly as they did. The menu is also marked unflushable, since a seek
+flushes the container and libbluray will not draw the page again on its own.
+
+libbluray composes a page only when something happens on the disc, so nothing
+would put a lost menu back, which is why moving a button was a way in.
+
+Seen on Gravity, whose menu playlist carries the PG streams that make Kodi open
+a subtitle stream over the top of the menu. A disc offering none of those never
+had the problem, which is why menus otherwise work.
+
+(cherry picked from commit 55c3aefa736b1b9673a4980600ce37eea212afcb)
+---
+ .../DVDCodecs/Overlay/DVDOverlay.h            | 25 ++++++++++++++++++-
+ .../DVDInputStreams/DVDInputStreamBluray.cpp  |  8 ++++++
+ .../cores/VideoPlayer/DVDOverlayContainer.cpp | 18 +++++++++++++
+ xbmc/cores/VideoPlayer/DVDOverlayContainer.h  |  5 ++++
+ .../cores/VideoPlayer/VideoPlayerSubtitle.cpp |  5 +++-
+ 5 files changed, 59 insertions(+), 2 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlay.h b/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlay.h
+index 1f37ab387f..d8f635927e 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlay.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlay.h
+@@ -22,6 +22,14 @@ enum DVDOverlayType
+   DVDOVERLAY_TYPE_GROUP   = 5,
+ };
+ 
++//! Where an overlay came from. Subtitles and a disc menu share one container, and only an
++//! overlay from the same source ends or replaces another.
++enum class DVDOverlaySource
++{
++  SUBTITLE,
++  MENU,
++};
++
+ enum class DVDOverlayStereoView
+ {
+   BOTH,
+@@ -44,6 +52,7 @@ public:
+     m_enableTextAlign = false;
+     m_overlayContainerFlushable = true;
+     m_setForcedMargins = false;
++    m_source = DVDOverlaySource::SUBTITLE;
+     m_stereoView = DVDOverlayStereoView::BOTH;
+   }
+ 
+@@ -58,6 +67,7 @@ public:
+     m_enableTextAlign = src.m_enableTextAlign;
+     m_overlayContainerFlushable = src.m_overlayContainerFlushable;
+     m_setForcedMargins = src.m_setForcedMargins;
++    m_source = src.m_source;
+     m_stereoView = src.m_stereoView;
+   }
+ 
+@@ -69,7 +79,8 @@ public:
+     return std::abs(iPTSStartTime - other.iPTSStartTime) < epsilon &&
+            std::abs(iPTSStopTime - other.iPTSStopTime) < epsilon && bForced == other.bForced &&
+            replace == other.replace &&
+-           m_overlayContainerFlushable == other.m_overlayContainerFlushable;
++           m_overlayContainerFlushable == other.m_overlayContainerFlushable &&
++           m_source == other.m_source;
+   }
+ 
+   bool IsOverlayType(DVDOverlayType type) const { return (m_type == type); }
+@@ -103,6 +114,17 @@ public:
+    */
+   bool IsOverlayContainerFlushable() const { return m_overlayContainerFlushable; }
+ 
++  /*
++   * \brief Say where the overlay came from: a subtitle stream unless told otherwise.
++   */
++  void SetSource(DVDOverlaySource source) { m_source = source; }
++
++  /*
++   * \brief Where the overlay came from. Only an overlay from the same source ends or
++   *        replaces this one.
++   */
++  DVDOverlaySource GetSource() const { return m_source; }
++
+   /*
+    * \brief Specify if the margins are handled by the subtitle codec/parser.
+    */
+@@ -125,6 +147,7 @@ protected:
+   bool m_enableTextAlign;
+   bool m_overlayContainerFlushable;
+   bool m_setForcedMargins;
++  DVDOverlaySource m_source;
+ };
+ 
+ using VecOverlays = std::vector<std::shared_ptr<CDVDOverlay>>;
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.cpp b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.cpp
+index fc4aca21da..a3934b18f6 100644
+--- a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.cpp
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.cpp
+@@ -783,6 +783,8 @@ void CDVDInputStreamBluray::OverlayClose()
+     plane.o.clear();
+   auto group = std::make_shared<CDVDOverlayGroup>();
+   group->bForced = true;
++  group->SetSource(DVDOverlaySource::MENU);
++  group->SetOverlayContainerFlushable(false);
+   m_player->OnDiscNavResult(static_cast<void*>(&group), BD_EVENT_MENU_OVERLAY);
+   m_hasOverlay = false;
+ #endif
+@@ -844,6 +846,12 @@ void CDVDInputStreamBluray::OverlayFlush(int64_t pts)
+   group->iPTSStartTime = static_cast<double>(pts);
+   group->iPTSStopTime  = 0;
+ 
++  // A menu, so that only the next page ends or replaces it and never a subtitle, and not
++  // flushable: a seek flushes the container, and libbluray will not draw the page again on
++  // its own.
++  group->SetSource(DVDOverlaySource::MENU);
++  group->SetOverlayContainerFlushable(false);
++
+   for(SPlane& plane : m_planes)
+   {
+     for(SOverlays::iterator it = plane.o.begin(); it != plane.o.end(); ++it)
+diff --git a/xbmc/cores/VideoPlayer/DVDOverlayContainer.cpp b/xbmc/cores/VideoPlayer/DVDOverlayContainer.cpp
+index d5b2e087b3..ad83a742cf 100644
+--- a/xbmc/cores/VideoPlayer/DVDOverlayContainer.cpp
++++ b/xbmc/cores/VideoPlayer/DVDOverlayContainer.cpp
+@@ -31,6 +31,12 @@ void CDVDOverlayContainer::ProcessAndAddOverlayIfValid(const std::shared_ptr<CDV
+   for(int i = m_overlays.size();i>0;)
+   {
+     i--;
++
++    // Only what came from the same place ends this. A menu sits in here alongside the
++    // subtitles it has nothing to do with, and a cue starting is no reason for it to go.
++    if (m_overlays[i]->GetSource() != pOverlay->GetSource())
++      continue;
++
+     if(m_overlays[i]->iPTSStopTime)
+     {
+       if(!m_overlays[i]->replace)
+@@ -85,6 +91,11 @@ void CDVDOverlayContainer::CleanUp(double pts)
+       while (!bNewer && ++it2 != m_overlays.end())
+       {
+         const std::shared_ptr<CDVDOverlay>& pOverlay2 = *it2;
++        // Only what came from the same place replaces this: a menu is redrawn by the
++        // next menu, and closing one sends an empty page to stand in for it, but a
++        // forced subtitle over the top of a menu replaces nothing.
++        if (pOverlay2->GetSource() != pOverlay->GetSource())
++          continue;
+         // There can be multiple overlays queued at same start point.
+         // Skip them to find a new start point.
+         if (pOverlay2->bForced && pOverlay2->iPTSStartTime <= pts)
+@@ -120,6 +131,13 @@ void CDVDOverlayContainer::Clear()
+   m_overlays.clear();
+ }
+ 
++void CDVDOverlayContainer::Clear(DVDOverlaySource source)
++{
++  std::unique_lock lock(*this);
++  std::erase_if(m_overlays, [source](const std::shared_ptr<CDVDOverlay>& ov)
++                { return ov->GetSource() == source; });
++}
++
+ size_t CDVDOverlayContainer::GetSize()
+ {
+   return m_overlays.size();
+diff --git a/xbmc/cores/VideoPlayer/DVDOverlayContainer.h b/xbmc/cores/VideoPlayer/DVDOverlayContainer.h
+index e64e445713..20b2d10e05 100644
+--- a/xbmc/cores/VideoPlayer/DVDOverlayContainer.h
++++ b/xbmc/cores/VideoPlayer/DVDOverlayContainer.h
+@@ -40,6 +40,11 @@ public:
+ 
+   void Clear(); // clear the fifo and delete all overlays
+ 
++  /*!
++   * \brief Remove every overlay that came from one source, leaving the others in place.
++   */
++  void Clear(DVDOverlaySource source);
++
+   /*
+    * \brief Flush the overlays.
+    */
+diff --git a/xbmc/cores/VideoPlayer/VideoPlayerSubtitle.cpp b/xbmc/cores/VideoPlayer/VideoPlayerSubtitle.cpp
+index 6529b01065..1e003fd2d5 100644
+--- a/xbmc/cores/VideoPlayer/VideoPlayerSubtitle.cpp
++++ b/xbmc/cores/VideoPlayer/VideoPlayerSubtitle.cpp
+@@ -47,6 +47,7 @@ std::shared_ptr<CDVDOverlayGroup> InitialiseNewOverlayGroup(std::shared_ptr<CDVD
+   group->bForced = overlay->bForced;
+   group->replace = overlay->replace;
+   group->SetOverlayContainerFlushable(overlay->IsOverlayContainerFlushable());
++  group->SetSource(overlay->GetSource());
+   group->m_overlays.emplace_back(overlay);
+   return group;
+ }
+@@ -194,8 +195,10 @@ void CVideoPlayerSubtitle::CloseStream(bool bWaitForBuffers)
+ 
+   m_dvdspus.FlushCurrentPacket();
+ 
++  // Only the subtitles: the container is shared with the disc menu, which nothing would
++  // draw again if it went with them.
+   if (!bWaitForBuffers)
+-    m_pOverlayContainer->Clear();
++    m_pOverlayContainer->Clear(DVDOverlaySource::SUBTITLE);
+ }
+ 
+ void CVideoPlayerSubtitle::Process(double pts, double offset)
+-- 
+2.56.0
+

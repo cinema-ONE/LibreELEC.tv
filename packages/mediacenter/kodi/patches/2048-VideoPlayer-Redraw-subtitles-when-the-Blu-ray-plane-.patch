@@ -1,0 +1,131 @@
+From 0fcfea52772f6280bccd03a19d3fdf4fd6953c31 Mon Sep 17 00:00:00 2001
+From: Dom Cobley <popcornmix@gmail.com>
+Date: Tue, 15 Sep 2026 19:54:45 +0100
+Subject: [PATCH 2048/2064] [VideoPlayer] Redraw subtitles when the Blu-ray
+ plane offset changes
+
+A Blu-ray 3D "1 plane + offset" title places its subtitles in depth by shifting
+the subtitle plane horizontally, and may vary that shift every frame. The offset
+was fetched per presented frame and applied at draw time, but nothing marked the
+GUI dirty when it changed.
+
+Where video has its own DRM plane the GUI walk is skipped whenever no control
+dirtied itself, so the subtitle plane kept whatever depth it was last drawn with.
+On a disc that steps the offset every frame the depth only moved when something
+unrelated dirtied the GUI, which on a Pi 4 measured between 0.25 and 2.5 changes
+a second against a 23.976fps source. Forcing the dirty region algorithm to always
+fill the viewport does not help, because that setting only governs what happens
+inside a render pass that is never entered.
+
+Fetch the offset in FrameMove, before the walk-skip decision is taken, and dirty
+from PrepareOverlays when it differs from the offset the overlays on screen were
+last drawn with. Comparing against what was drawn rather than what was last seen
+means a frame skipped for any other reason keeps asking until the redraw happens.
+Gated on an overlay actually being visible, so nothing dirties while no subtitle
+is on screen.
+
+(cherry picked from commit 884c629806fee5540c234cd3d88d118c899c816d)
+---
+ .../VideoPlayer/VideoRenderers/OverlayRenderer.cpp   | 12 ++++++++++++
+ .../VideoPlayer/VideoRenderers/OverlayRenderer.h     |  4 ++++
+ .../VideoPlayer/VideoRenderers/RenderManager.cpp     |  9 ++++++---
+ 3 files changed, 22 insertions(+), 3 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.cpp
+index 6895930c08..3ad7fef5eb 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.cpp
+@@ -175,6 +175,8 @@ void CRenderer::Render(int idx, float depth)
+     }
+   }
+ 
++  m_lastDrawnPlaneOffset = m_subtitlePlaneOffset;
++
+   ReleaseUnused();
+ }
+ 
+@@ -502,6 +504,7 @@ void CRenderer::PrepareOverlays(int idx)
+ 
+   bool doMarkDirty = false;
+   bool hasImageSpu = false;
++  bool hasVisible = false;
+   for (auto& e : m_buffers[idx])
+   {
+     // Clear last frame's cached output; libass may have invalidated the
+@@ -522,6 +525,7 @@ void CRenderer::PrepareOverlays(int idx)
+     if (o.IsOverlayType(DVDOVERLAY_TYPE_IMAGE) || o.IsOverlayType(DVDOVERLAY_TYPE_SPU))
+     {
+       hasImageSpu = true;
++      hasVisible = true;
+       if (o.m_textureid == 0)
+         doMarkDirty = true;
+       continue;
+@@ -543,6 +547,8 @@ void CRenderer::PrepareOverlays(int idx)
+     int currentChange = 0;
+     e.renderedImages =
+         ovAss.GetLibassHandler()->RenderImage(e.pts, rOpts, m_overlayStyle, &currentChange);
++    if (e.renderedImages)
++      hasVisible = true;
+     if (currentChange > 0)
+     {
+       // Persist on the overlay so a skipped GUI render does not drop the change.
+@@ -558,6 +564,12 @@ void CRenderer::PrepareOverlays(int idx)
+     doMarkDirty = true;
+   m_prevHadImageSpu = hasImageSpu;
+ 
++  // A title may vary the plane offset every frame, moving the subtitle in depth without
++  // touching its bitmap, which nothing else here would notice. Compared against what was
++  // drawn rather than what was last seen, so a skipped GUI walk keeps asking.
++  if (hasVisible && m_subtitlePlaneOffset != m_lastDrawnPlaneOffset)
++    doMarkDirty = true;
++
+   if (doMarkDirty)
+     MarkDirty();
+ }
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.h b/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.h
+index de4d13150e..1383d2a503 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.h
+@@ -267,6 +267,10 @@ namespace OVERLAY {
+     //! What the disc asks the subtitle plane to be shifted by, in the video's own pixels,
+     //! or nothing where the title places its subtitles in depth no differently frame to frame.
+     std::optional<int> m_subtitlePlaneOffset;
++
++    //! The offset the overlays on screen were last actually drawn with. Compared against
++    //! m_subtitlePlaneOffset to notice a depth change a redraw has yet to show.
++    std::optional<int> m_lastDrawnPlaneOffset;
+     // Current subtitle position
+     int m_subtitlePosition{0};
+     // The calibration line for MANUAL alignment and the frame height otherwise,
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
+index e94cf16fef..0e985881d6 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
+@@ -354,9 +354,14 @@ void CRenderManager::FrameMove()
+   m_playerPort->UpdateGuiRender(IsGuiLayer() || !m_pRenderer->VideoBypassesFramebuffer() ||
+                                 firstFrame);
+ 
++  // Must be set before PrepareOverlays, which dirties on a change: the GUI walk-skip
++  // decision is taken after FrameMove and before anything renders.
++  m_overlays.SetSubtitlePlaneOffset(
++      m_playerPort->GetSubtitlePlaneOffset(m_Queue[m_presentsource].pts));
++
+   // Run libass for the current PTS and cache the output for ConvertLibass
+   // to use during the render pass. PrepareOverlays MarkDirty's on libass
+-  // changes and on PGS/DVB/SPU arrival/disappearance.
++  // changes, on PGS/DVB/SPU arrival/disappearance and on a plane offset change.
+   m_overlays.PrepareOverlays(m_presentsource);
+ }
+ 
+@@ -657,8 +662,6 @@ void CRenderManager::Render(bool clear, DWORD flags, DWORD alpha, bool gui)
+     CRect src, dst, view;
+     m_pRenderer->GetVideoRect(src, dst, view);
+     m_overlays.SetVideoRect(src, dst, view);
+-    m_overlays.SetSubtitlePlaneOffset(
+-        m_playerPort->GetSubtitlePlaneOffset(m_Queue[m_presentsource].pts));
+     m_overlays.Render(m_presentsource);
+ 
+     if (m_renderDebug)
+-- 
+2.56.0
+
